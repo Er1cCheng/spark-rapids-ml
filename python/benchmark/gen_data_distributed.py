@@ -450,6 +450,15 @@ class RegressionDataGen(DataGenBaseMeta):
                     y = np.dot(X_p, ground_truth) + bias
                 if noise > 0.0:
                     y += generator_p.normal(scale=noise, size=y.shape)
+                
+                # Logistric Regression sigmoid and sample   
+                if logistic_regression:
+                	if use_cupy:
+                	    prob = 1 - 1/(1 + cp.exp(-y))
+                	    y = cp.random.binomial(1, prob)
+                	else:
+                	    prob = 1 - 1/(1 + np.exp(-y))
+                	    y = np.random.binomial(1, prob)
 
                 # Logistric Regression sigmoid and sample
                 if logistic_regression:
