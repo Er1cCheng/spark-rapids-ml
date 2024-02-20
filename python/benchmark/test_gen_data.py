@@ -167,7 +167,10 @@ def test_make_regression(dtype: str, low_rank: bool, use_gpu: str) -> None:
 @pytest.mark.parametrize("dtype", ["float64"])
 @pytest.mark.parametrize("use_gpu", ["True", "False"])
 @pytest.mark.parametrize("redundant_cols", ["0", "2"])
-def test_make_sparse_regression(dtype: str, use_gpu: str, redundant_cols: str) -> None:
+@pytest.mark.parametrize("density_curve", ["None", "Linear", "Exponential"])
+def test_make_sparse_regression(
+    dtype: str, use_gpu: str, redundant_cols: str, density_curve: str
+) -> None:
     input_args = [
         "--num_rows",
         "100",
@@ -193,6 +196,8 @@ def test_make_sparse_regression(dtype: str, use_gpu: str, redundant_cols: str) -
         "0.25",
         "--redundant_cols",
         redundant_cols,
+        "--density_curve",
+        density_curve,
     ]
 
     data_gen = SparseRegressionDataGen(input_args)
@@ -229,7 +234,7 @@ def test_make_sparse_regression(dtype: str, use_gpu: str, redundant_cols: str) -
         total = 100 * total_cols
 
         # If there is no random shuffled redundant cols, we can check the total density
-        if redundant_cols == "0":
+        if redundant_cols == "0" and density_curve == "None":
             assert count > total * 0.24 and count < total * 0.26
 
 
