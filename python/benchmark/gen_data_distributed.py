@@ -581,31 +581,28 @@ class SparseRegressionDataGen(DataGenBaseMeta):
         density_curve = params.get("density_curve", "None")
 
         # Check for valid redundant columns
-        new_density = ((cols + redundant_cols) * density - redundant_cols) / cols
-        print("new new", new_density)
-        if redundant_cols > 0 and new_density <= 0:
+        if redundant_cols > 0 and redundant_cols / cols > density:
             logging.warning(
                 "Redundant columns would break density property, setting to zero instead"
             )
             redundant_cols = 0
         else:
-            cols += redundant_cols
-
-        # Compute Density Curve
-        density_values = np.array([])
-        if density_curve != "None":
-            if density_curve == "Linear":
-                density_values = np.linspace(num_partitions / rows, density, orig_cols)
-            elif density_curve == "Exponential":
-                density_values = np.logspace(
-                    np.log10(num_partitions / rows), np.log10(density), orig_cols
-                )
-            else:
-                logging.warning(
-                    "Unsupported density curve, canceling density curve option",
-                    density_curve,
-                )
-                density_curve = "None"
+            # Compute Density Curve
+            density_values = np.array([])
+            if density_curve != "None":
+                if density_curve == "Linear":
+                    density_values = np.linspace(num_partitions / rows, density, orig_cols)
+                elif density_curve == "Exponential":
+                    density_values = np.logspace(
+                        np.log10(num_partitions / rows), np.log10(density), orig_cols
+                    )
+                else:
+                    logging.warning(
+                        "Unsupported density curve, canceling density curve option",
+                        density_curve,
+                    )
+                    density_curve = "None"
+            orig_cols = cols
 
         # Generate ground truth upfront.
         ground_truth = np.zeros((cols, n_targets))
@@ -648,7 +645,7 @@ class SparseRegressionDataGen(DataGenBaseMeta):
                 dfs.append(pdf)
                 if start == -1:
                     start = pdf["id"][0]
-            
+
             # Generate column by column if there is a density curve
             if density_curve != "None":
                 sparse_matrix = sp.sparse.csr_matrix((0, 0))
@@ -678,7 +675,8 @@ class SparseRegressionDataGen(DataGenBaseMeta):
                     sparse_matrix = sp.sparse.random(
                         num_rows_per_partition,
                         orig_cols,
-                        density=new_density,
+                        density=(density - redundant_cols / cols)
+                        / (1 - redundant_cols / cols),
                         random_state=generator,
                         format="csr",
                         dtype=dtype,
@@ -689,7 +687,6 @@ class SparseRegressionDataGen(DataGenBaseMeta):
                 if shuffle:
                     informative_shuffle_indices = np.arange(orig_cols)
                     sparse_matrix = sparse_matrix[:, informative_shuffle_indices]
-
                 informative = sparse_matrix[:, :n_informative]
 
                 if use_cupy:
@@ -699,6 +696,7 @@ class SparseRegressionDataGen(DataGenBaseMeta):
 
                 redundants = informative.dot(redundant_mul)
                 sparse_matrix = sp.sparse.hstack([sparse_matrix, redundants]).tocsr()
+                
             elif density_curve == "None":
                 # Generate random sparse matrix without redundant columns directly
                 sparse_matrix = sp.sparse.random(

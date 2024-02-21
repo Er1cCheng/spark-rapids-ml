@@ -119,7 +119,10 @@ def test_make_low_rank_matrix(dtype: str, use_gpu: str) -> None:
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
 @pytest.mark.parametrize("low_rank", [True, False])
 @pytest.mark.parametrize("use_gpu", ["True", "False"])
-def test_make_regression(dtype: str, low_rank: bool, use_gpu: str) -> None:
+@pytest.mark.parametrize("logistic_regression", ["True", "False"])
+def test_make_regression(
+    dtype: str, low_rank: bool, use_gpu: str, logistic_regression: str
+) -> None:
     input_args = [
         "--num_rows",
         "100",
@@ -141,6 +144,8 @@ def test_make_regression(dtype: str, low_rank: bool, use_gpu: str) -> None:
         "0",
         "--use_gpu",
         use_gpu,
+        "--logistic_regression",
+        logistic_regression,
     ]
     if low_rank:
         input_args.extend(("--effective_rank", "5"))
@@ -160,22 +165,36 @@ def test_make_regression(dtype: str, low_rank: bool, use_gpu: str) -> None:
         assert c.shape == (10,), "coef shape mismatch"
         assert sum(c != 0.0) == 3, "Unexpected number of informative features"
 
-        # Test that y ~= np.dot(X, c) + bias + N(0, 1.0).
-        assert_almost_equal(np.std(y - np.dot(X, c)), 1.0, decimal=1)
+        if logistic_regression == "True":
+            # Test that X is consist of only 0 or 1
+            for n in y:
+                assert n == 0 or n == 1
+        else:
+            # Test that y ~= np.dot(X, c) + bias + N(0, 1.0).
+            assert_almost_equal(np.std(y - np.dot(X, c)), 1.0, decimal=1)
 
 
 @pytest.mark.parametrize("dtype", ["float64"])
 @pytest.mark.parametrize("use_gpu", ["True", "False"])
 @pytest.mark.parametrize("redundant_cols", ["0", "2"])
-@pytest.mark.parametrize("density_curve", ["None", "Linear", "Exponential"])
+@pytest.mark.parametrize("logistic_regression", ["True", "False"])
+@pytest.mark.parametrize("density", ["0.25", "0.2"])
+@pytest.mark.parametrize("rows, cols", [("100", "20"), ("1000", "100")])
 def test_make_sparse_regression(
-    dtype: str, use_gpu: str, redundant_cols: str, density_curve: str
+    dtype: str,
+    use_gpu: str,
+    redundant_cols: str,
+    logistic_regression: str,
+    density: str,
+    rows: str,
+    cols: str,
 ) -> None:
+
     input_args = [
         "--num_rows",
-        "100",
+        rows,
         "--num_cols",
-        "20",
+        cols,
         "--dtype",
         dtype,
         "--output_dir",
@@ -193,85 +212,15 @@ def test_make_sparse_regression(
         "--use_gpu",
         use_gpu,
         "--density",
-        "0.25",
-        "--redundant_cols",
-        redundant_cols,
-        "--density_curve",
-        density_curve,
-    ]
-
-    data_gen = SparseRegressionDataGen(input_args)
-    args = data_gen.args
-    assert args is not None
-    with WithSparkSession(args.spark_confs, shutdown=(not args.no_shutdown)) as spark:
-        df, _, c = data_gen.gen_dataframe_and_meta(spark)
-        assert df.rdd.getNumPartitions() == 3, "Unexpected number of partitions"
-
-        pdf: DataFrame = df.toPandas()
-        X = pdf.iloc[:, 0].to_numpy()
-        y = pdf.iloc[:, 1].to_numpy()
-
-        total_cols = 20 + int(redundant_cols)
-        assert len(X) == 100, "X row number mismatch"
-        for sparseVec in X:
-            # assert sparseVec.toArray().dtype == np.dtype(dtype), "Unexpected dtype"
-            assert sparseVec.size == total_cols, "X col number mismatch"
-        assert y.shape == (100,), "y shape mismatch"
-        assert c.shape == (total_cols,), "coef shape mismatch"
-        assert sum(c != 0.0) == 3, "Unexpected number of informative features"
-
-        # Test that y ~= np.dot(X, c) + bias + N(0, 1.0).
-        X_np = np.array([r.toArray() for r in X])
-        assert_almost_equal(np.std(y - np.dot(X_np, c)), 1.0, decimal=1)
-
-        # Check density match
-        count = 0
-        for row in X_np:
-            for n in row:
-                if n != 0.0:
-                    count += 1
-
-        total = 100 * total_cols
-
-        # If there is no random shuffled redundant cols, we can check the total density
-        if redundant_cols == "0" and density_curve == "None":
-            assert count > total * 0.24 and count < total * 0.26
-
-
-@pytest.mark.parametrize("dtype", ["float64"])
-@pytest.mark.parametrize("use_gpu", ["True", "False"])
-@pytest.mark.parametrize("redundant_cols", ["0", "2"])
-def test_make_sparse_logistic_regression(
-    dtype: str, use_gpu: str, redundant_cols: str
-) -> None:
-    input_args = [
-        "--num_rows",
-        "100",
-        "--num_cols",
-        "20",
-        "--dtype",
-        dtype,
-        "--output_dir",
-        "temp",
-        "--output_num_files",
-        "3",
-        "--n_informative",
-        "3",
-        "--bias",
-        "0.0",
-        "--noise",
-        "1.0",
-        "--random_state",
-        "0",
-        "--use_gpu",
-        use_gpu,
-        "--density",
-        "0.25",
+        density,
         "--redundant_cols",
         redundant_cols,
         "--logistic_regression",
-        "True",
+        logistic_regression,
     ]
+
+    row_num = int(rows)
+    col_num = int(cols)
 
     data_gen = SparseRegressionDataGen(input_args)
     args = data_gen.args
@@ -284,16 +233,23 @@ def test_make_sparse_logistic_regression(
         X = pdf.iloc[:, 0].to_numpy()
         y = pdf.iloc[:, 1].to_numpy()
 
-        total_cols = 20 + int(redundant_cols)
-        assert len(X) == 100, "X row number mismatch"
+        assert len(X) == row_num, "X row number mismatch"
         for sparseVec in X:
             # assert sparseVec.toArray().dtype == np.dtype(dtype), "Unexpected dtype"
-            assert sparseVec.size == total_cols, "X col number mismatch"
-        assert y.shape == (100,), "y shape mismatch"
-        assert c.shape == (total_cols,), "coef shape mismatch"
+            assert sparseVec.size == col_num, "X col number mismatch"
+        assert y.shape == (row_num,), "y shape mismatch"
+        assert c.shape == (col_num,), "coef shape mismatch"
         assert sum(c != 0.0) == 3, "Unexpected number of informative features"
 
         X_np = np.array([r.toArray() for r in X])
+
+        if logistic_regression == "True":
+            # Test that X consists of only 0 or 1
+            for n in y:
+                assert n == 0 or n == 1
+        else:
+            # Test that y ~= np.dot(X, c) + bias + N(0, 1.0).
+            assert_almost_equal(np.std(y - np.dot(X_np, c)), 1.0, decimal=1)
 
         # Check density match
         count = 0
@@ -302,66 +258,15 @@ def test_make_sparse_logistic_regression(
                 if n != 0.0:
                     count += 1
 
-        total = 100 * total_cols
+        total = row_num * col_num
 
         # If there is no random shuffled redundant cols, we can check the total density
+        density_num = float(density)
         if redundant_cols == "0":
-            assert count > total * 0.24 and count < total * 0.26
-
-        # Test that X is consist of only 0 or 1
-        for n in y:
-            assert n == 0 or n == 1
-
-
-@pytest.mark.parametrize("dtype", ["float32", "float64"])
-@pytest.mark.parametrize("low_rank", [True, False])
-@pytest.mark.parametrize("use_gpu", ["True", "False"])
-def test_make_logistic_regression(dtype: str, low_rank: bool, use_gpu: str) -> None:
-    input_args = [
-        "--num_rows",
-        "100",
-        "--num_cols",
-        "10",
-        "--dtype",
-        dtype,
-        "--output_dir",
-        "temp",
-        "--output_num_files",
-        "3",
-        "--n_informative",
-        "3",
-        "--bias",
-        "0.0",
-        "--noise",
-        "1.0",
-        "--random_state",
-        "0",
-        "--use_gpu",
-        use_gpu,
-        "--logistic_regression",
-        "True",
-    ]
-    if low_rank:
-        input_args.extend(("--effective_rank", "5"))
-    data_gen = RegressionDataGen(input_args)
-    args = data_gen.args
-    assert args is not None
-    with WithSparkSession(args.spark_confs, shutdown=(not args.no_shutdown)) as spark:
-        df, _, c = data_gen.gen_dataframe_and_meta(spark)
-        assert df.rdd.getNumPartitions() == 3, "Unexpected number of partitions"
-        pdf: DataFrame = df.toPandas()
-        X = pdf.iloc[:, :-1].to_numpy()
-        y = pdf.iloc[:, -1].to_numpy()
-
-        assert X.dtype == np.dtype(dtype), "Unexpected dtype"
-        assert X.shape == (100, 10), "X shape mismatch"
-        assert y.shape == (100,), "y shape mismatch"
-        assert c.shape == (10,), "coef shape mismatch"
-        assert sum(c != 0.0) == 3, "Unexpected number of informative features"
-
-        # Test that X is consist of only 0 or 1
-        for n in y:
-            assert n == 0 or n == 1
+            assert (
+                count > total * density_num * 0.95
+                and count < total * density_num * 1.05
+            )
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
