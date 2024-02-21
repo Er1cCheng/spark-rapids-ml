@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 import pyspark
 import scipy as sp
+import random
 from gen_data import DataGenBase, DefaultDataGen, main
 from packaging import version
 from pyspark.ml.linalg import Vectors, VectorUDT
@@ -542,6 +543,7 @@ class SparseRegressionDataGen(DataGenBaseMeta):
         params["use_gpu"] = bool
         params["logistic_regression"] = bool
         params["density_curve"] = str
+        params["n_classes"] = int
         return params
 
     def gen_dataframe_and_meta(
@@ -574,11 +576,21 @@ class SparseRegressionDataGen(DataGenBaseMeta):
         shuffle = params.get("shuffle", True)
         n_informative = params.get("n_informative", 10)
         n_targets = params.get("n_targets", 1)
+        n_classes = params.get("n_classes", 2)
         use_gpu = params.get("use_gpu", False)
         logistic_regression = params.get("logistic_regression", False)
         density = params.get("density", 0.1)
         redundant_cols = params.get("redundant_cols", 0)
         density_curve = params.get("density_curve", "None")
+        
+        # Check for multinomial logistic regression
+        if (logistic_regression and n_classes < 2):
+            logging.warning("Can not have logistic regression with 2 classes, default to 2")
+            
+        multinomial_log = logistic_regression and (n_classes > 2)
+        
+        # Number of non_redundant columns
+        orig_cols = cols - redundant_cols
 
         # Check for valid redundant columns
         if redundant_cols > 0 and redundant_cols / cols > density:
@@ -586,35 +598,45 @@ class SparseRegressionDataGen(DataGenBaseMeta):
                 "Redundant columns would break density property, setting to zero instead"
             )
             redundant_cols = 0
-        else:
-            # Compute Density Curve
-            density_values = np.array([])
-            if density_curve != "None":
-                if density_curve == "Linear":
-                    density_values = np.linspace(num_partitions / rows, density, orig_cols)
-                elif density_curve == "Exponential":
-                    density_values = np.logspace(
-                        np.log10(num_partitions / rows), np.log10(density), orig_cols
-                    )
-                else:
-                    logging.warning(
-                        "Unsupported density curve, canceling density curve option",
-                        density_curve,
-                    )
-                    density_curve = "None"
             orig_cols = cols
+            
+        # Compute Density Curve
+        density_values = np.array([])
+        if density_curve != "None":
+            if density_curve == "Linear":
+                density_values = np.linspace(num_partitions / rows, density, orig_cols)
+            elif density_curve == "Exponential":
+                density_values = np.logspace(
+                    np.log10(num_partitions / rows), np.log10(density), orig_cols
+                )
+            else:
+                logging.warning(
+                    "Unsupported density curve, canceling density curve option",
+                    density_curve,
+                )
+                density_curve = "None"
+        
 
         # Generate ground truth upfront.
-        ground_truth = np.zeros((cols, n_targets))
-        ground_truth[:n_informative, :] = 100 * generator.uniform(
-            size=(n_informative, n_targets)
-        )
+        if multinomial_log:
+            ground_truth = np.zeros((n_classes-1, cols, n_targets))
+            ground_truth[:, :n_informative, :] = 100 * generator.uniform(
+                size=(n_informative, n_targets)
+            )
+        else:
+            ground_truth = np.zeros((cols, n_targets))
+            ground_truth[:n_informative, :] = 100 * generator.uniform(
+                size=(n_informative, n_targets)
+            )
 
         if shuffle:
             # Shuffle feature indices upfront.
             col_indices = np.arange(cols)
             generator.shuffle(col_indices)
-            ground_truth = ground_truth[col_indices]
+            if multinomial_log:
+                ground_truth = ground_truth[:, col_indices]
+            else:
+                ground_truth = ground_truth[col_indices]
 
         # Create different partition seeds for sample generation.
         random.seed(params["random_state"])
@@ -742,7 +764,10 @@ class SparseRegressionDataGen(DataGenBaseMeta):
                 generator_p = np.random.RandomState(partition_seeds[partition_index])
 
             # Label Calculation
-            y = sparse_matrix.dot(ground_truth) + bias
+            if multinomial_log:
+                y = np.array([sparse_matrix.dot(class_truth) + bias] for class_truth in ground_truth)
+            else:
+                y = sparse_matrix.dot(ground_truth) + bias
 
             # Type conversion
             if use_cupy:
@@ -756,12 +781,23 @@ class SparseRegressionDataGen(DataGenBaseMeta):
 
             # Logistric Regression sigmoid and sample
             if logistic_regression:
-                if use_cupy:
-                    prob = 1 - 1 / (1 + cp.exp(-y))
-                    y = cp.random.binomial(1, prob)
+                if multinomial_log:
+                    y = np.asarray(y)
+                    probs = [sp.special.softmax(target_weight) for target_weight in y]
+                    
+                    y = [random.choices(range(n_classes), weights=p)[0] for p in probs]
+                    
+                    if use_cupy:
+                        y = cp.asarray(y)
+                    else:
+                        y = np.asarray(y)
                 else:
-                    prob = 1 - 1 / (1 + np.exp(-y))
-                    y = np.random.binomial(1, prob)
+                    if use_cupy:
+                        prob = 1 - 1 / (1 + cp.exp(-y))
+                        y = cp.random.binomial(1, prob)
+                    else:
+                        prob = 1 - 1 / (1 + np.exp(-y))
+                        y = np.random.binomial(1, prob)
 
             del sparse_matrix
 

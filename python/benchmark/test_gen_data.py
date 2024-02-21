@@ -180,6 +180,7 @@ def test_make_regression(
 @pytest.mark.parametrize("logistic_regression", ["True", "False"])
 @pytest.mark.parametrize("density", ["0.25", "0.2"])
 @pytest.mark.parametrize("rows, cols", [("100", "20"), ("1000", "100")])
+@pytest.mark.parametrize("density_curve", ["None", "Linear", "Exponential"])
 def test_make_sparse_regression(
     dtype: str,
     use_gpu: str,
@@ -188,6 +189,7 @@ def test_make_sparse_regression(
     density: str,
     rows: str,
     cols: str,
+    density_curve: str
 ) -> None:
 
     input_args = [
@@ -217,6 +219,8 @@ def test_make_sparse_regression(
         redundant_cols,
         "--logistic_regression",
         logistic_regression,
+        "--density_curve",
+        density_curve
     ]
 
     row_num = int(rows)
@@ -262,11 +266,110 @@ def test_make_sparse_regression(
 
         # If there is no random shuffled redundant cols, we can check the total density
         density_num = float(density)
-        if redundant_cols == "0":
+        if redundant_cols == "0" and density_curve == "None":
             assert (
                 count > total * density_num * 0.95
                 and count < total * density_num * 1.05
             )
+            
+@pytest.mark.parametrize("dtype", ["float64"])
+@pytest.mark.parametrize("use_gpu", ["True", "False"])
+@pytest.mark.parametrize("redundant_cols", ["0", "2"])
+@pytest.mark.parametrize("logistic_regression", ["True", "False"])
+@pytest.mark.parametrize("density", ["0.25", "0.2"])
+@pytest.mark.parametrize("rows, cols", [("100", "20"), ("1000", "100")])
+@pytest.mark.parametrize("density_curve", ["None", "Linear", "Exponential"])
+def test_make_multi(
+    dtype: str,
+    use_gpu: str,
+    redundant_cols: str,
+    logistic_regression: str,
+    density: str,
+    rows: str,
+    cols: str,
+    density_curve: str
+) -> None:
+
+    input_args = [
+        "--num_rows",
+        rows,
+        "--num_cols",
+        cols,
+        "--dtype",
+        dtype,
+        "--output_dir",
+        "temp",
+        "--output_num_files",
+        "3",
+        "--n_informative",
+        "3",
+        "--bias",
+        "0.0",
+        "--noise",
+        "1.0",
+        "--random_state",
+        "0",
+        "--use_gpu",
+        use_gpu,
+        "--density",
+        density,
+        "--redundant_cols",
+        redundant_cols,
+        "--logistic_regression",
+        logistic_regression,
+        "--density_curve",
+        density_curve
+    ]
+
+    row_num = int(rows)
+    col_num = int(cols)
+
+    data_gen = SparseRegressionDataGen(input_args)
+    args = data_gen.args
+    assert args is not None
+    with WithSparkSession(args.spark_confs, shutdown=(not args.no_shutdown)) as spark:
+        df, _, c = data_gen.gen_dataframe_and_meta(spark)
+        assert df.rdd.getNumPartitions() == 3, "Unexpected number of partitions"
+
+        pdf: DataFrame = df.toPandas()
+        X = pdf.iloc[:, 0].to_numpy()
+        y = pdf.iloc[:, 1].to_numpy()
+
+        assert len(X) == row_num, "X row number mismatch"
+        for sparseVec in X:
+            # assert sparseVec.toArray().dtype == np.dtype(dtype), "Unexpected dtype"
+            assert sparseVec.size == col_num, "X col number mismatch"
+        assert y.shape == (row_num,), "y shape mismatch"
+        assert c.shape == (col_num,), "coef shape mismatch"
+        assert sum(c != 0.0) == 3, "Unexpected number of informative features"
+
+        X_np = np.array([r.toArray() for r in X])
+
+        if logistic_regression == "True":
+            # Test that X consists of only 0 or 1
+            for n in y:
+                assert n == 0 or n == 1
+        else:
+            # Test that y ~= np.dot(X, c) + bias + N(0, 1.0).
+            assert_almost_equal(np.std(y - np.dot(X_np, c)), 1.0, decimal=1)
+
+        # Check density match
+        count = 0
+        for row in X_np:
+            for n in row:
+                if n != 0.0:
+                    count += 1
+
+        total = row_num * col_num
+
+        # If there is no random shuffled redundant cols, we can check the total density
+        density_num = float(density)
+        if redundant_cols == "0" and density_curve == "None":
+            assert (
+                count > total * density_num * 0.95
+                and count < total * density_num * 1.05
+            )
+    
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float64"])

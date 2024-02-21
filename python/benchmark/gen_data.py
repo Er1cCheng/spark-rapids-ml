@@ -483,10 +483,6 @@ def main(registered_data_gens: Dict[str, Any], repartition: bool) -> None:
     # Must repartition for default.
     if args.type == "default":
         repartition = True
-<<<<<<< HEAD
-=======
-
->>>>>>> origin/branch-24.02
     model = args.type
     assert data_gen.args is not None
     args = data_gen.args
