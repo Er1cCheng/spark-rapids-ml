@@ -177,7 +177,9 @@ def test_make_regression(
 @pytest.mark.parametrize("dtype", ["float64"])
 @pytest.mark.parametrize("use_gpu", ["True", "False"])
 @pytest.mark.parametrize("redundant_cols", ["0", "2"])
-@pytest.mark.parametrize("logistic_regression, n_classes", [("True", "2"), ("True", "4"), ("False", "0")])
+@pytest.mark.parametrize(
+    "logistic_regression, n_classes", [("True", "2"), ("True", "4"), ("False", "0")]
+)
 @pytest.mark.parametrize("density", ["0.25", "0.2"])
 @pytest.mark.parametrize("rows, cols", [("100", "20"), ("1000", "100")])
 @pytest.mark.parametrize("density_curve", ["None", "Linear", "Exponential"])
@@ -190,7 +192,7 @@ def test_make_sparse_regression(
     density: str,
     rows: str,
     cols: str,
-    density_curve: str
+    density_curve: str,
 ) -> None:
 
     input_args = [
@@ -223,7 +225,7 @@ def test_make_sparse_regression(
         "--logistic_regression",
         logistic_regression,
         "--density_curve",
-        density_curve
+        density_curve,
     ]
 
     row_num = int(rows)
@@ -246,14 +248,25 @@ def test_make_sparse_regression(
             # assert sparseVec.toArray().dtype == np.dtype(dtype), "Unexpected dtype"
             assert sparseVec.size == col_num, "X col number mismatch"
         assert y.shape == (row_num,), "y shape mismatch"
-        
+
         if logistic_regression == "False" or n_classes_num == 2:
             assert c.shape == (col_num,), "coef shape mismatch"
             assert np.count_nonzero(c) == 3, "Unexpected number of informative features"
         else:
-            print(c.shape, (n_classes, col_num,))
-            assert c.shape == (n_classes_num, col_num,), "coef shape mismatch"
-            assert np.count_nonzero(c) == 3 * n_classes_num, "Unexpected number of informative features"
+            print(
+                c.shape,
+                (
+                    n_classes,
+                    col_num,
+                ),
+            )
+            assert c.shape == (
+                n_classes_num,
+                col_num,
+            ), "coef shape mismatch"
+            assert (
+                np.count_nonzero(c) == 3 * n_classes_num
+            ), "Unexpected number of informative features"
 
         X_np = np.array([r.toArray() for r in X])
 
@@ -283,14 +296,17 @@ def test_make_sparse_regression(
                 count > total * density_num * 0.95
                 and count < total * density_num * 1.05
             )
-            
+
+
 @pytest.mark.parametrize("dtype", ["float64"])
-@pytest.mark.parametrize("use_gpu", ["False"])
+@pytest.mark.parametrize("use_gpu", ["True", "False"])
 @pytest.mark.parametrize("redundant_cols", ["0"])
-@pytest.mark.parametrize("logistic_regression, n_classes", [("True", "2"), ("True", "4")])
+@pytest.mark.parametrize(
+    "logistic_regression, n_classes", [("True", "2"), ("True", "4"), ("False", "0")]
+)
 @pytest.mark.parametrize("density", ["0.25"])
 @pytest.mark.parametrize("rows, cols", [("100", "20")])
-@pytest.mark.parametrize("density_curve", ["None"])
+@pytest.mark.parametrize("density_curve", ["None", "Linear"])
 def test_make_multi(
     dtype: str,
     use_gpu: str,
@@ -300,7 +316,7 @@ def test_make_multi(
     density: str,
     rows: str,
     cols: str,
-    density_curve: str
+    density_curve: str,
 ) -> None:
 
     input_args = [
@@ -333,7 +349,7 @@ def test_make_multi(
         "--logistic_regression",
         logistic_regression,
         "--density_curve",
-        density_curve
+        density_curve,
     ]
 
     row_num = int(rows)
@@ -356,14 +372,25 @@ def test_make_multi(
             # assert sparseVec.toArray().dtype == np.dtype(dtype), "Unexpected dtype"
             assert sparseVec.size == col_num, "X col number mismatch"
         assert y.shape == (row_num,), "y shape mismatch"
-        
+
         if logistic_regression == "False" or n_classes_num == 2:
             assert c.shape == (col_num,), "coef shape mismatch"
             assert np.count_nonzero(c) == 3, "Unexpected number of informative features"
         else:
-            print(c.shape, (n_classes, col_num,))
-            assert c.shape == (n_classes_num, col_num,), "coef shape mismatch"
-            assert np.count_nonzero(c) == 3 * n_classes_num, "Unexpected number of informative features"
+            print(
+                c.shape,
+                (
+                    n_classes,
+                    col_num,
+                ),
+            )
+            assert c.shape == (
+                n_classes_num,
+                col_num,
+            ), "coef shape mismatch"
+            assert (
+                np.count_nonzero(c) == 3 * n_classes_num
+            ), "Unexpected number of informative features"
 
         X_np = np.array([r.toArray() for r in X])
 
@@ -393,7 +420,6 @@ def test_make_multi(
                 count > total * density_num * 0.95
                 and count < total * density_num * 1.05
             )
-    
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float64"])

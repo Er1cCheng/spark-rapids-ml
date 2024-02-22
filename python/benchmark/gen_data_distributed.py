@@ -23,7 +23,6 @@ import numpy as np
 import pandas as pd
 import pyspark
 import scipy as sp
-import random
 from gen_data import DataGenBase, DefaultDataGen, main
 from packaging import version
 from pyspark.ml.linalg import Vectors, VectorUDT
@@ -582,13 +581,15 @@ class SparseRegressionDataGen(DataGenBaseMeta):
         density = params.get("density", 0.1)
         redundant_cols = params.get("redundant_cols", 0)
         density_curve = params.get("density_curve", "None")
-        
+
         # Check for multinomial logistic regression
-        if (logistic_regression and n_classes < 2):
-            logging.warning("Can not have logistic regression with 2 classes, default to 2")
-            
+        if logistic_regression and n_classes < 2:
+            logging.warning(
+                "Can not have logistic regression with 2 classes, default to 2"
+            )
+
         multinomial_log = logistic_regression and (n_classes > 2)
-        
+
         # Number of non_redundant columns
         orig_cols = cols - redundant_cols
 
@@ -599,7 +600,7 @@ class SparseRegressionDataGen(DataGenBaseMeta):
             )
             redundant_cols = 0
             orig_cols = cols
-            
+
         # Compute Density Curve
         density_values = np.array([])
         if density_curve != "None":
@@ -615,7 +616,6 @@ class SparseRegressionDataGen(DataGenBaseMeta):
                     density_curve,
                 )
                 density_curve = "None"
-        
 
         # Generate ground truth upfront.
         if multinomial_log:
@@ -718,7 +718,7 @@ class SparseRegressionDataGen(DataGenBaseMeta):
 
                 redundants = informative.dot(redundant_mul)
                 sparse_matrix = sp.sparse.hstack([sparse_matrix, redundants]).tocsr()
-                
+
             elif density_curve == "None":
                 # Generate random sparse matrix without redundant columns directly
                 sparse_matrix = sp.sparse.random(
@@ -765,41 +765,57 @@ class SparseRegressionDataGen(DataGenBaseMeta):
 
             # Label Calculation
             if multinomial_log:
-                y = np.squeeze(np.array([[sparse_matrix.dot(class_truth) + bias] for class_truth in ground_truth]))
+                y = np.squeeze(
+                    np.array(
+                        [
+                            [sparse_matrix.dot(class_truth) + bias]
+                            for class_truth in ground_truth
+                        ]
+                    )
+                )
                 y = np.transpose(y)
             else:
                 y = sparse_matrix.dot(ground_truth) + bias
 
             # Type conversion
             if use_cupy:
-                y = cp.asarray(y)
+                y_p = cp.asarray(y)
             else:
-                y = np.asarray(y)
+                y_p = np.asarray(y)
 
             # Random Noise
             if noise > 0.0:
-                y += generator_p.normal(scale=noise, size=y.shape)
+                y_p += generator_p.normal(scale=noise, size=y.shape)
 
             # Logistric Regression sigmoid and sample
             if logistic_regression:
                 if multinomial_log:
                     if use_cupy:
-                        y = y.get()
+                        y = y_p.get()
+                        del y_p
+
                     probs = [sp.special.softmax(target_weight) for target_weight in y]
-                    
-                    y = [random.choices(range(n_classes), weights=p)[0] for p in probs]
-                    
+
+                    multi_labels = [
+                        random.choices(range(n_classes), weights=p)[0] for p in probs
+                    ]
+
                     if use_cupy:
-                        y = cp.asarray(y)
+                        y = cp.asarray(multi_labels)
                     else:
-                        y = np.asarray(y)
+                        y = np.asarray(multi_labels)
                 else:
                     if use_cupy:
-                        prob = 1 - 1 / (1 + cp.exp(-y))
+                        prob = 1 - 1 / (1 + cp.exp(-y_p))
+                        del y_p
                         y = cp.random.binomial(1, prob)
+                        print("Here", type(y))
                     else:
-                        prob = 1 - 1 / (1 + np.exp(-y))
+                        prob = 1 - 1 / (1 + np.exp(-y_p))
+                        del y_p
                         y = np.random.binomial(1, prob)
+            else:
+                y = y_p
 
             del sparse_matrix
 
