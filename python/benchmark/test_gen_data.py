@@ -180,9 +180,16 @@ def test_make_regression(
 @pytest.mark.parametrize(
     "logistic_regression, n_classes", [("True", "2"), ("True", "4"), ("False", "0")]
 )
-@pytest.mark.parametrize("density", ["0.25", "0.2"])
-@pytest.mark.parametrize("rows, cols", [("100", "20"), ("1000", "100")])
-@pytest.mark.parametrize("density_curve", ["None", "Linear", "Exponential"])
+@pytest.mark.parametrize(
+    "density", ["0.25", pytest.param("0.2", marks=pytest.mark.slow)]
+)
+@pytest.mark.parametrize(
+    "rows, cols", [("100", "20"), pytest.param("1000", "100", marks=pytest.mark.slow)]
+)
+@pytest.mark.parametrize(
+    "density_curve",
+    ["None", "Linear", pytest.param("Exponential", marks=pytest.mark.slow)],
+)
 def test_make_sparse_regression(
     dtype: str,
     use_gpu: str,
