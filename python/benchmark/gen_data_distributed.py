@@ -619,7 +619,7 @@ class SparseRegressionDataGen(DataGenBaseMeta):
 
         # Generate ground truth upfront.
         if multinomial_log:
-            ground_truth = np.zeros((n_classes-1, cols, n_targets))
+            ground_truth = np.zeros((n_classes, cols, n_targets))
             ground_truth[:, :n_informative, :] = 100 * generator.uniform(
                 size=(n_informative, n_targets)
             )
@@ -765,7 +765,8 @@ class SparseRegressionDataGen(DataGenBaseMeta):
 
             # Label Calculation
             if multinomial_log:
-                y = np.array([sparse_matrix.dot(class_truth) + bias] for class_truth in ground_truth)
+                y = np.squeeze(np.array([[sparse_matrix.dot(class_truth) + bias] for class_truth in ground_truth]))
+                y = np.transpose(y)
             else:
                 y = sparse_matrix.dot(ground_truth) + bias
 
@@ -782,7 +783,8 @@ class SparseRegressionDataGen(DataGenBaseMeta):
             # Logistric Regression sigmoid and sample
             if logistic_regression:
                 if multinomial_log:
-                    y = np.asarray(y)
+                    if use_cupy:
+                        y = y.get()
                     probs = [sp.special.softmax(target_weight) for target_weight in y]
                     
                     y = [random.choices(range(n_classes), weights=p)[0] for p in probs]

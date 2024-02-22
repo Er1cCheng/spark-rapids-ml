@@ -177,7 +177,7 @@ def test_make_regression(
 @pytest.mark.parametrize("dtype", ["float64"])
 @pytest.mark.parametrize("use_gpu", ["True", "False"])
 @pytest.mark.parametrize("redundant_cols", ["0", "2"])
-@pytest.mark.parametrize("logistic_regression", ["True", "False"])
+@pytest.mark.parametrize("logistic_regression, n_classes", [("True", "2"), ("True", "4"), ("False", "0")])
 @pytest.mark.parametrize("density", ["0.25", "0.2"])
 @pytest.mark.parametrize("rows, cols", [("100", "20"), ("1000", "100")])
 @pytest.mark.parametrize("density_curve", ["None", "Linear", "Exponential"])
@@ -186,6 +186,7 @@ def test_make_sparse_regression(
     use_gpu: str,
     redundant_cols: str,
     logistic_regression: str,
+    n_classes: str,
     density: str,
     rows: str,
     cols: str,
@@ -205,6 +206,8 @@ def test_make_sparse_regression(
         "3",
         "--n_informative",
         "3",
+        "--n_classes",
+        n_classes,
         "--bias",
         "0.0",
         "--noise",
@@ -225,6 +228,7 @@ def test_make_sparse_regression(
 
     row_num = int(rows)
     col_num = int(cols)
+    n_classes_num = int(n_classes)
 
     data_gen = SparseRegressionDataGen(input_args)
     args = data_gen.args
@@ -242,25 +246,33 @@ def test_make_sparse_regression(
             # assert sparseVec.toArray().dtype == np.dtype(dtype), "Unexpected dtype"
             assert sparseVec.size == col_num, "X col number mismatch"
         assert y.shape == (row_num,), "y shape mismatch"
-        assert c.shape == (col_num,), "coef shape mismatch"
-        assert sum(c != 0.0) == 3, "Unexpected number of informative features"
+        
+        if logistic_regression == "False" or n_classes_num == 2:
+            assert c.shape == (col_num,), "coef shape mismatch"
+            assert np.count_nonzero(c) == 3, "Unexpected number of informative features"
+        else:
+            print(c.shape, (n_classes, col_num,))
+            assert c.shape == (n_classes_num, col_num,), "coef shape mismatch"
+            assert np.count_nonzero(c) == 3 * n_classes_num, "Unexpected number of informative features"
 
         X_np = np.array([r.toArray() for r in X])
 
         if logistic_regression == "True":
-            # Test that X consists of only 0 or 1
+            # Test that X consists of only discrete label
+            possible_labels = range(n_classes_num)
             for n in y:
-                assert n == 0 or n == 1
+                found = False
+                for l in possible_labels:
+                    if n == l:
+                        found = True
+                        break
+                assert found, "Invalid label"
         else:
             # Test that y ~= np.dot(X, c) + bias + N(0, 1.0).
             assert_almost_equal(np.std(y - np.dot(X_np, c)), 1.0, decimal=1)
 
         # Check density match
-        count = 0
-        for row in X_np:
-            for n in row:
-                if n != 0.0:
-                    count += 1
+        count = np.count_nonzero(X_np)
 
         total = row_num * col_num
 
@@ -273,17 +285,18 @@ def test_make_sparse_regression(
             )
             
 @pytest.mark.parametrize("dtype", ["float64"])
-@pytest.mark.parametrize("use_gpu", ["True", "False"])
-@pytest.mark.parametrize("redundant_cols", ["0", "2"])
-@pytest.mark.parametrize("logistic_regression", ["True", "False"])
-@pytest.mark.parametrize("density", ["0.25", "0.2"])
-@pytest.mark.parametrize("rows, cols", [("100", "20"), ("1000", "100")])
-@pytest.mark.parametrize("density_curve", ["None", "Linear", "Exponential"])
+@pytest.mark.parametrize("use_gpu", ["False"])
+@pytest.mark.parametrize("redundant_cols", ["0"])
+@pytest.mark.parametrize("logistic_regression, n_classes", [("True", "2"), ("True", "4")])
+@pytest.mark.parametrize("density", ["0.25"])
+@pytest.mark.parametrize("rows, cols", [("100", "20")])
+@pytest.mark.parametrize("density_curve", ["None"])
 def test_make_multi(
     dtype: str,
     use_gpu: str,
     redundant_cols: str,
     logistic_regression: str,
+    n_classes: str,
     density: str,
     rows: str,
     cols: str,
@@ -303,6 +316,8 @@ def test_make_multi(
         "3",
         "--n_informative",
         "3",
+        "--n_classes",
+        n_classes,
         "--bias",
         "0.0",
         "--noise",
@@ -323,6 +338,7 @@ def test_make_multi(
 
     row_num = int(rows)
     col_num = int(cols)
+    n_classes_num = int(n_classes)
 
     data_gen = SparseRegressionDataGen(input_args)
     args = data_gen.args
@@ -340,25 +356,33 @@ def test_make_multi(
             # assert sparseVec.toArray().dtype == np.dtype(dtype), "Unexpected dtype"
             assert sparseVec.size == col_num, "X col number mismatch"
         assert y.shape == (row_num,), "y shape mismatch"
-        assert c.shape == (col_num,), "coef shape mismatch"
-        assert sum(c != 0.0) == 3, "Unexpected number of informative features"
+        
+        if logistic_regression == "False" or n_classes_num == 2:
+            assert c.shape == (col_num,), "coef shape mismatch"
+            assert np.count_nonzero(c) == 3, "Unexpected number of informative features"
+        else:
+            print(c.shape, (n_classes, col_num,))
+            assert c.shape == (n_classes_num, col_num,), "coef shape mismatch"
+            assert np.count_nonzero(c) == 3 * n_classes_num, "Unexpected number of informative features"
 
         X_np = np.array([r.toArray() for r in X])
 
         if logistic_regression == "True":
-            # Test that X consists of only 0 or 1
+            # Test that X consists of only discrete label
+            possible_labels = range(n_classes_num)
             for n in y:
-                assert n == 0 or n == 1
+                found = False
+                for l in possible_labels:
+                    if n == l:
+                        found = True
+                        break
+                assert found, "Invalid label"
         else:
             # Test that y ~= np.dot(X, c) + bias + N(0, 1.0).
             assert_almost_equal(np.std(y - np.dot(X_np, c)), 1.0, decimal=1)
 
         # Check density match
-        count = 0
-        for row in X_np:
-            for n in row:
-                if n != 0.0:
-                    count += 1
+        count = np.count_nonzero(X_np)
 
         total = row_num * col_num
 
