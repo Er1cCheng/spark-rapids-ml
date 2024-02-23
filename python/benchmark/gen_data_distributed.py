@@ -315,6 +315,7 @@ class RegressionDataGen(DataGenBaseMeta):
         # must replace the None to the correct type
         params["effective_rank"] = int
         params["random_state"] = int
+        params["n_classes"] = int
         params["use_gpu"] = bool
         params["logistic_regression"] = bool
         return params
@@ -349,8 +350,17 @@ class RegressionDataGen(DataGenBaseMeta):
         effective_rank = params.get("effective_rank", None)
         n_informative = params.get("n_informative", 10)
         n_targets = params.get("n_targets", 1)
+        n_classes = params.get("n_classes", 2)
         use_gpu = params.get("use_gpu", False)
         logistic_regression = params.get("logistic_regression", False)
+
+        # Check for multinomial logistic regression
+        if logistic_regression and n_classes < 2:
+            logging.warning(
+                "Can not have logistic regression with 2 classes, default to 2"
+            )
+
+        multinomial_log = logistic_regression and (n_classes > 2)
 
         # Description (from sklearn):
         #
@@ -408,16 +418,25 @@ class RegressionDataGen(DataGenBaseMeta):
             )
 
         # Generate ground truth upfront.
-        ground_truth = np.zeros((cols, n_targets))
-        ground_truth[:n_informative, :] = 100 * generator.uniform(
-            size=(n_informative, n_targets)
-        )
+        if multinomial_log:
+            ground_truth = np.zeros((n_classes, cols, n_targets))
+            ground_truth[:, :n_informative, :] = 100 * generator.uniform(
+                size=(n_classes, n_informative, n_targets)
+            )
+        else:
+            ground_truth = np.zeros((cols, n_targets))
+            ground_truth[:n_informative, :] = 100 * generator.uniform(
+                size=(n_informative, n_targets)
+            )
 
         if shuffle:
             # Shuffle feature indices upfront.
             col_indices = np.arange(cols)
             generator.shuffle(col_indices)
-            ground_truth = ground_truth[col_indices]
+            if multinomial_log:
+                ground_truth = ground_truth[:, col_indices]
+            else:
+                ground_truth = ground_truth[col_indices]
 
         # Create different partition seeds for sample generation.
         random.seed(params["random_state"])
@@ -455,30 +474,63 @@ class RegressionDataGen(DataGenBaseMeta):
                     else:
                         X_p[:, :] = X_p[:, col_indices]
 
-                if use_cupy:
-                    y = cp.dot(X_p, ground_truth_cp) + bias
+                # Label Calculation
+                if multinomial_log:
+                    if use_cupy:
+                        y = cp.squeeze(
+                            cp.array(
+                                [
+                                    [cp.dot(X_p, class_truth) + bias]
+                                    for class_truth in ground_truth_cp
+                                ]
+                            )
+                        )
+                        y = cp.transpose(y)
+                    else:
+                        y = np.squeeze(
+                            np.array(
+                                [
+                                    [np.dot(X_p, class_truth) + bias]
+                                    for class_truth in ground_truth
+                                ]
+                            )
+                        )
+                        y = np.transpose(y)
                 else:
-                    y = np.dot(X_p, ground_truth) + bias
+                    if use_cupy:
+                        y = cp.dot(X_p, ground_truth_cp) + bias
+                    else:
+                        y = np.dot(X_p, ground_truth) + bias
+
                 if noise > 0.0:
                     y += generator_p.normal(scale=noise, size=y.shape)
 
                 # Logistric Regression sigmoid and sample
                 if logistic_regression:
-                    if use_cupy:
-                        prob = 1 / (1 + cp.exp(-y))
-                        y = cp.random.binomial(1, prob)
-                    else:
-                        prob = 1 / (1 + np.exp(-y))
-                        y = np.random.binomial(1, prob)
+                    if multinomial_log:
+                        if use_cupy:
+                            y = y.get()
 
-                # Logistric Regression sigmoid and sample
-                if logistic_regression:
-                    if use_cupy:
-                        prob = 1 / (1 + cp.exp(-y))
-                        y = cp.random.binomial(1, prob)
+                        probs = [
+                            sp.special.softmax(target_weight) for target_weight in y
+                        ]
+
+                        multi_labels = [
+                            random.choices(range(n_classes), weights=p)[0]
+                            for p in probs
+                        ]
+
+                        if use_cupy:
+                            y = cp.asarray(multi_labels)
+                        else:
+                            y = np.asarray(multi_labels)
                     else:
-                        prob = 1 / (1 + np.exp(-y))
-                        y = np.random.binomial(1, prob)
+                        if use_cupy:
+                            prob = 1 / (1 + cp.exp(-y))
+                            y = cp.random.binomial(1, prob)
+                        else:
+                            prob = 1 / (1 + np.exp(-y))
+                            y = np.random.binomial(1, prob)
 
                 n_partition_rows = X_p.shape[0]
                 if shuffle:
@@ -621,7 +673,7 @@ class SparseRegressionDataGen(DataGenBaseMeta):
         if multinomial_log:
             ground_truth = np.zeros((n_classes, cols, n_targets))
             ground_truth[:, :n_informative, :] = 100 * generator.uniform(
-                size=(n_informative, n_targets)
+                size=(n_classes, n_informative, n_targets)
             )
         else:
             ground_truth = np.zeros((cols, n_targets))
@@ -809,7 +861,6 @@ class SparseRegressionDataGen(DataGenBaseMeta):
                         prob = 1 - 1 / (1 + cp.exp(-y_p))
                         del y_p
                         y = cp.random.binomial(1, prob)
-                        print("Here", type(y))
                     else:
                         prob = 1 - 1 / (1 + np.exp(-y_p))
                         del y_p
