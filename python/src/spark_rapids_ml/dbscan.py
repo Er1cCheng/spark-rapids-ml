@@ -15,11 +15,11 @@
 #
 
 from abc import ABCMeta
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast, Iterator
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast, Iterator, Sequence, TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
-from .core import _CumlModel, Pred, pred
+from .core import _CumlModel, Pred, pred, _use_sparse_in_cuml, alias
 import pyspark
 from pyspark import keyword_only
 from pyspark.ml.linalg import Vector
@@ -43,6 +43,7 @@ from .core import (
     FitInputType,
     _ConstructFunc,
     _CumlCaller,
+    _CumlCommon,
     _CumlEstimator,
     _CumlModelWithPredictionCol,
     _EvaluateFunc,
@@ -57,13 +58,23 @@ from pyspark.ml.param.shared import (
 )
 from .metrics import EvalMetricInfo
 from .params import HasFeaturesCols, P, _CumlClass, _CumlParams
+from .common.cuml_context import CumlContext
+from .metrics import EvalMetricInfo
+from .params import _CumlParams
 from .utils import (
     _ArrayOrder,
-    _concat_and_free,
+    _get_gpu_id,
     _get_spark_session,
+    _is_local,
+    _is_standalone_or_localcluster,
+    dtype_to_pyspark_type,
     get_logger,
-    java_uid,
+    _concat_and_free,
 )
+
+if TYPE_CHECKING:
+    import cudf
+    from pyspark.ml._typing import ParamMap
 
 class DBSCANClass(_CumlClass):
     @classmethod
@@ -250,7 +261,7 @@ class DBSCAN(DBSCANClass, _CumlEstimator, _DBSCANCumlParams):
         model.calc_core_sample_indices = self.getOrDefault("calc_core_sample_indices")
         model.verbose = self.verbose
 
-        model.input_schema = dataset.schema
+        model.out_schema = dataset.schema
 
         return model
     
@@ -288,13 +299,13 @@ class DBSCANModel(DBSCANClass, _CumlCaller, _CumlModelWithPredictionCol, _DBSCAN
         self._dbscan_spark_model = None
     
     def _out_schema(self, *args) -> Union[StructType, str]:
-        return StructType(
-            [
-                StructField(self._get_prediction_name(), IntegerType(), False),
-            ]
-        )
+        # return StructType(
+        #     [
+        #         StructField(self._get_prediction_name(), IntegerType(), False),
+        #     ]
+        # )
     
-        # return self.input_schema.add(self._get_prediction_name(), IntegerType(), False)
+        return self.out_schema
 
     def _transform_array_order(self) -> _ArrayOrder:
         return "C"
@@ -336,13 +347,187 @@ class DBSCANModel(DBSCANClass, _CumlCaller, _CumlModelWithPredictionCol, _DBSCAN
             else:
                 # features are either cp or np arrays here
                 concated = _concat_and_free(df_list, order=array_order)
-            data_df = concated[:, :-1]
 
-            res = list(dbscan.fit_predict(data_df).to_numpy())
+            res = list(dbscan.fit_predict(concated).to_numpy())
 
             return pd.Series(res)
         
         return _cuml_fit
+    
+    def _call_cuml_fit_func_df(
+        self,
+        dataset: DataFrame,
+        partially_collect: bool = True,
+        paramMaps: Optional[Sequence["ParamMap"]] = None,
+    ) -> DataFrame:
+        """
+        Fits a model to the input dataset. This is called by the default implementation of fit.
+
+        Parameters
+        ----------
+        dataset : :py:class:`pyspark.sql.DataFrame`
+            input dataset
+
+        Returns
+        -------
+        :class:`Transformer`
+            fitted model
+        """
+        self._validate_parameters()
+
+        cls = self.__class__
+
+        result_df = dataset.toPandas()
+        # logger = get_logger(cls)
+        # logger.info(result_df)
+
+        select_cols, multi_col_names, dimension, _ = self._pre_process_data(dataset)
+
+        num_workers = self.num_workers
+
+        dataset = dataset.select(*select_cols)
+
+        if dataset.rdd.getNumPartitions() != num_workers:
+            dataset = self._repartition_dataset(dataset)
+
+        is_local = _is_local(_get_spark_session().sparkContext)
+
+        cuda_managed_mem_enabled = (
+            _get_spark_session().conf.get("spark.rapids.ml.uvm.enabled", "false")
+            == "true"
+        )
+        if cuda_managed_mem_enabled:
+            get_logger(cls).info("CUDA managed memory enabled.")
+
+        # parameters passed to subclass
+        params: Dict[str, Any] = {
+            param_alias.cuml_init: self.cuml_params,
+        }
+
+        # Convert the paramMaps into cuml paramMaps
+        fit_multiple_params = []
+        if paramMaps is not None:
+            for paramMap in paramMaps:
+                tmp_fit_multiple_params = {}
+                for k, v in paramMap.items():
+                    name = self._get_cuml_param(k.name, False)
+                    assert name is not None
+                    tmp_fit_multiple_params[name] = self._get_cuml_mapping_value(
+                        name, v
+                    )
+                fit_multiple_params.append(tmp_fit_multiple_params)
+        params[param_alias.fit_multiple_params] = fit_multiple_params
+
+        cuml_fit_func = self._get_cuml_fit_func(
+            dataset, None if len(fit_multiple_params) == 0 else fit_multiple_params
+        )
+
+        array_order = self._fit_array_order()
+
+        cuml_verbose = self.cuml_params.get("verbose", False)
+
+        use_sparse_array = _use_sparse_in_cuml(dataset)
+
+        (enable_nccl, require_ucx) = self._require_nccl_ucx()
+
+        def _train_udf(pdf_iter: Iterator[pd.DataFrame]) -> pd.DataFrame:
+            import cupy as cp
+            import cupyx
+            from pyspark import BarrierTaskContext
+
+            context = BarrierTaskContext.get()
+            partition_id = context.partitionId()
+            logger = get_logger(cls)
+
+            # set gpu device
+            _CumlCommon._set_gpu_device(context, is_local)
+
+            if cuda_managed_mem_enabled:
+                import rmm
+                from rmm.allocators.cupy import rmm_cupy_allocator
+
+                rmm.reinitialize(
+                    managed_memory=True,
+                    devices=_CumlCommon._get_gpu_device(context, is_local),
+                )
+                cp.cuda.set_allocator(rmm_cupy_allocator)
+
+            _CumlCommon._initialize_cuml_logging(cuml_verbose)
+
+            # handle the input
+            # inputs = [(X, Optional(y)), (X, Optional(y))]
+            logger.info("Loading data into python worker memory")
+            inputs = []
+            sizes = []
+
+            for pdf in pdf_iter:
+                sizes.append(pdf.shape[0])
+                if multi_col_names:
+                    features = np.array(pdf[multi_col_names], order=array_order)
+                elif use_sparse_array:
+                    # sparse vector
+                    features = _read_csr_matrix_from_unwrapped_spark_vec(pdf)
+                else:
+                    # dense vector
+                    features = np.array(list(pdf[alias.data]), order=array_order)
+
+                # experiments indicate it is faster to convert to numpy array and then to cupy array than directly
+                # invoking cupy array on the list
+                if cuda_managed_mem_enabled:
+                    features = (
+                        cp.array(features)
+                        if use_sparse_array is False
+                        else cupyx.scipy.sparse.csr_matrix(features)
+                    )
+
+                label = pdf[alias.label] if alias.label in pdf.columns else None
+                row_number = (
+                    pdf[alias.row_number] if alias.row_number in pdf.columns else None
+                )
+                inputs.append((features, label, row_number))
+
+            if len(sizes) == 0 or all(sz == 0 for sz in sizes):
+                raise RuntimeError(
+                    "A python worker received no data.  Please increase amount of data or use fewer workers."
+                )
+
+            logger.info("Initializing cuml context")
+            with CumlContext(
+                partition_id, num_workers, context, enable_nccl, require_ucx
+            ) as cc:
+                params[param_alias.handle] = cc.handle
+                params[param_alias.part_sizes] = sizes
+                params[param_alias.num_cols] = dimension
+                params[param_alias.loop] = cc._loop
+
+                logger.info("Invoking cuml fit")
+
+                # call the cuml fit function
+                # *note*: cuml_fit_func may delete components of inputs to free
+                # memory.  do not rely on inputs after this call.
+                result = cuml_fit_func(inputs, params)
+
+                result_df[self._get_prediction_name()] = result
+                logger.info("Cuml fit complete")
+
+            if partially_collect == True:
+                if enable_nccl:
+                    context.barrier()
+
+                if context.partitionId() == 0:
+                    yield result_df
+                    # yield pd.DataFrame(data=result)
+            else:
+                yield result_df
+                # yield pd.DataFrame(data=result)
+
+        pipelined_rdd = (
+            dataset.mapInPandas(_train_udf, schema=self._out_schema())  # type: ignore
+            .rdd.barrier()
+            .mapPartitions(lambda x: x)
+        )
+
+        return pipelined_rdd
 
     def _get_cuml_transform_func(
         self, dataset: DataFrame, eval_metric_info: Optional[EvalMetricInfo] = None
@@ -378,6 +563,9 @@ class DBSCANModel(DBSCANClass, _CumlCaller, _CumlModelWithPredictionCol, _DBSCAN
         return _construct_dbscan, _transform_internal, None
     
     def _transform(self, dataset: DataFrame) -> DataFrame:
+        self.out_schema.add("worker_id", IntegerType(), False)
+        self.out_schema.add(self._get_prediction_name(), IntegerType(), False)
+
         dataset_copies = [dataset.alias(f"dataset_copy_{i}").withColumn("worker_id", lit(i)) for i in range(self.num_workers)]
 
         dataset_concat = dataset_copies[0]
@@ -387,22 +575,22 @@ class DBSCANModel(DBSCANClass, _CumlCaller, _CumlModelWithPredictionCol, _DBSCAN
         dataset_concat.repartition(self.num_workers, "worker_id")
 
         # Return
-        rdd = self._call_cuml_fit_func(
+        rdd = self._call_cuml_fit_func_df(
             dataset=dataset_concat,
             partially_collect=False,
             paramMaps=None,
         )
 
-        pred_name = self._get_prediction_name()
         pred_df = rdd.toDF()
+        pred_df = pred_df.filter(pred_df["worker_id"] == 0).drop("worker_id")
+
         return pred_df
-        window_spec = Window.orderBy(lit(1))
-        pred_df = pred_df.withColumn("index", row_number().over(window_spec))
-        dataset = dataset.withColumn("index", row_number().over(window_spec))
+    
+        # window_spec = Window.orderBy(lit(1))
+        # pred_df = pred_df.withColumn("index", row_number().over(window_spec))
+        # dataset = dataset.withColumn("index", row_number().over(window_spec))
 
         # dataset.show()
         # pred_df.show()
 
-        return pred_df
-
-        return dataset.join(pred_df, "index").drop("index")
+        # return dataset.join(pred_df, "index").drop("index")
