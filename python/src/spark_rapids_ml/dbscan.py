@@ -39,7 +39,7 @@ from pyspark.ml.linalg import Vector
 from pyspark.ml.param.shared import HasFeaturesCol, Param, Params, TypeConverters
 from pyspark.sql import Column
 from pyspark.sql.dataframe import DataFrame
-from pyspark.sql.functions import lit, monotonically_increasing_id, row_number
+from pyspark.sql.functions import lit, monotonically_increasing_id, row_number, spark_partition_id
 from pyspark.sql.pandas.functions import pandas_udf
 from pyspark.sql.types import (
     ArrayType,
@@ -257,7 +257,10 @@ class DBSCAN(DBSCANClass, _CumlEstimator, _DBSCANCumlParams):
 
             return chunks
 
-        raw_data: np.ndarray = np.array(dataset.toPandas())
+        select_cols, multi_col_names, dimension, _ = self._pre_process_data(dataset)
+        use_sparse_array = _use_sparse_in_cuml(dataset)
+        input_dataset = dataset.select(*select_cols)
+        raw_data: np.ndarray = np.array(input_dataset.toPandas())
 
         broadcast_raw_data = [
             spark.sparkContext.broadcast(chunk) for chunk in _chunk_arr(raw_data)
@@ -267,7 +270,10 @@ class DBSCAN(DBSCANClass, _CumlEstimator, _DBSCANCumlParams):
             raw_data_=broadcast_raw_data,
             n_cols=len(raw_data[0]),
             dtype=type(raw_data[0][0][0]).__name__,
-            out_schema=dataset.schema,
+            output_schema=dataset.schema,
+            input_cols=input_dataset.columns,
+            multi_col_names=multi_col_names,
+            use_sparse_array=use_sparse_array,
         )
 
         model._num_workers = self.num_workers
@@ -304,7 +310,10 @@ class DBSCANModel(
         n_cols: int,
         dtype: str,
         raw_data_: List[pyspark.broadcast.Broadcast],
-        out_schema: StructType,
+        output_schema: StructType,
+        input_cols: List[str],
+        multi_col_names: List[str] | None,
+        use_sparse_array: bool
     ):
         super(DBSCANClass, self).__init__()
 
@@ -315,7 +324,11 @@ class DBSCANModel(
         super(_DBSCANCumlParams, self).__init__()
 
         self._dbscan_spark_model = None
-        self.out_schema = out_schema
+        self.output_schema = output_schema
+        self.input_cols = input_cols
+        self.raw_data_ = raw_data_
+        self.multi_col_names = multi_col_names
+        self.use_sparse_array = use_sparse_array
 
     def _pre_process_data(self, dataset: DataFrame) -> Tuple[
         List[Column],
@@ -328,13 +341,7 @@ class DBSCANModel(
     def _out_schema(
         self, input_schema: StructType = StructType()
     ) -> Union[StructType, str]:
-        # return StructType(
-        #     [
-        #         StructField(self._get_prediction_name(), IntegerType(), False),
-        #     ]
-        # )
-
-        return self.out_schema
+        return self.output_schema
 
     def _transform_array_order(self) -> _ArrayOrder:
         return "C"
@@ -353,6 +360,43 @@ class DBSCANModel(
         dtype = self.dtype
         n_cols = self.n_cols
         array_order = self._fit_array_order()
+        logger = get_logger(self.__class__)
+
+        cuda_managed_mem_enabled = (
+            _get_spark_session().conf.get("spark.rapids.ml.uvm.enabled", "false")
+            == "true"
+        )
+
+        inputs = []
+
+        for pdf_bc in self.raw_data_:
+            pdf = pd.DataFrame(data=pdf_bc.value, columns=self.input_cols)
+
+            if self.multi_col_names:
+                features = np.array(pdf[self.multi_col_names], order=array_order)
+            elif self.use_sparse_array:
+                # sparse vector
+                features = _read_csr_matrix_from_unwrapped_spark_vec(pdf)
+            else:
+                # dense vector
+                features = np.array(list(pdf[alias.data]), order=array_order)
+
+            # experiments indicate it is faster to convert to numpy array and then to cupy array than directly
+            # invoking cupy array on the list
+            if cuda_managed_mem_enabled:
+                features = (
+                    cp.array(features)
+                    if use_sparse_array is False
+                    else cupyx.scipy.sparse.csr_matrix(features)
+                )
+
+            inputs.append(features)
+        
+        if isinstance(inputs[0], pd.DataFrame):
+            concated = pd.concat(inputs)
+        else:
+            # features are either cp or np arrays here
+            concated = _concat_and_free(inputs, order=array_order)
 
         def _cuml_fit(
             dfs: FitInputType,
@@ -372,13 +416,6 @@ class DBSCANModel(
             dbscan.n_cols = n_cols
             dbscan.dtype = np.dtype(dtype)
 
-            df_list = [x for (x, _, _) in dfs]
-            if isinstance(df_list[0], pd.DataFrame):
-                concated = pd.concat(df_list)
-            else:
-                # features are either cp or np arrays here
-                concated = _concat_and_free(df_list, order=array_order)
-
             res = list(dbscan.fit_predict(concated).to_numpy())
 
             return pd.Series(res)
@@ -386,12 +423,11 @@ class DBSCANModel(
         return _cuml_fit
 
     def fit_post_process(
-        self, fit_result: Dict[str, Any], features_df: pd.DataFrame, partition_id: int
+        self, fit_result: Dict[str, Any]
     ) -> pd.DataFrame:
-        # features_df["worker_id"] = partition_id
-        features_df[self._get_prediction_name()] = fit_result
+        self.features_df[self._get_prediction_name()] = fit_result
 
-        return features_df
+        return self.features_df
 
     def _call_cuml_fit_func_df(
         self,
@@ -415,10 +451,6 @@ class DBSCANModel(
         self._validate_parameters()
 
         cls = self.__class__
-
-        features_df = dataset.toPandas()
-        # logger = get_logger(cls)
-        # logger.info(result_df)
 
         select_cols, multi_col_names, dimension, _ = self._pre_process_data(dataset)
 
@@ -552,12 +584,10 @@ class DBSCANModel(
                 # memory.  do not rely on inputs after this call.
                 result = cuml_fit_func(inputs, params)
                 result_df = (
-                    fit_post_process_func(result, features_df, partition_id)
+                    fit_post_process_func(result)
                     if fit_post_process_func is not None
                     else pd.DataFrame(data=result)
                 )
-                # result_df["worker_id"] = partition_id
-                # result_df[self._get_prediction_name()] = result
                 logger.info("Cuml fit complete")
 
             if partially_collect == True:
@@ -566,10 +596,8 @@ class DBSCANModel(
 
                 if context.partitionId() == 0:
                     yield result_df
-                    # yield pd.DataFrame(data=result)
             else:
                 yield result_df
-                # yield pd.DataFrame(data=result)
 
         pipelined_rdd = (
             dataset.mapInPandas(_train_udf, schema=self._out_schema())  # type: ignore
@@ -616,29 +644,21 @@ class DBSCANModel(
         return _construct_dbscan, _transform_internal, None
 
     def _transform(self, dataset: DataFrame) -> DataFrame:
-        self.out_schema.add("worker_id", IntegerType(), False)
-        self.out_schema.add(self._get_prediction_name(), IntegerType(), False)
+        logger = get_logger(self.__class__)
+        self.features_df = dataset.toPandas()
+        self.output_schema.add(self._get_prediction_name(), IntegerType(), False)
 
-        dataset_copies = [
-            dataset.alias(f"dataset_copy_{i}").withColumn("worker_id", lit(i))
-            for i in range(self.num_workers)
-        ]
-
-        dataset_concat = dataset_copies[0]
-        for df in dataset_copies[1:]:
-            dataset_concat = dataset_concat.union(df)
-
-        dataset_concat.repartition(self.num_workers, "worker_id")
+        default_num_partitions = dataset.rdd.getNumPartitions()
 
         # Return
         rdd = self._call_cuml_fit_func_df(
-            dataset=dataset_concat,
+            dataset=dataset,
             partially_collect=False,
             paramMaps=None,
         )
+        rdd = rdd.repartition(default_num_partitions)
 
         pred_df = rdd.toDF()
-        pred_df = pred_df.filter(pred_df["worker_id"] == 0).drop("worker_id")
 
         return pred_df
 
