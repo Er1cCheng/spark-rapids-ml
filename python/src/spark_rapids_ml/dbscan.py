@@ -39,13 +39,20 @@ from pyspark.ml.linalg import Vector
 from pyspark.ml.param.shared import HasFeaturesCol, Param, Params, TypeConverters
 from pyspark.sql import Column
 from pyspark.sql.dataframe import DataFrame
-from pyspark.sql.functions import lit, monotonically_increasing_id, row_number, spark_partition_id
+from pyspark.sql.functions import (
+    col,
+    lit,
+    monotonically_increasing_id,
+    row_number,
+    spark_partition_id,
+)
 from pyspark.sql.pandas.functions import pandas_udf
 from pyspark.sql.types import (
     ArrayType,
     DoubleType,
     FloatType,
     IntegerType,
+    LongType,
     Row,
     StringType,
     StructField,
@@ -118,6 +125,7 @@ class _DBSCANCumlParams(_CumlParams, HasFeaturesCol, HasFeaturesCols):
             metric="euclidean",
             max_mbytes_per_batch=None,
             calc_core_sample_indices=True,
+            idCol=alias.row_number,
         )
 
     eps = Param(
@@ -170,6 +178,13 @@ class _DBSCANCumlParams(_CumlParams, HasFeaturesCol, HasFeaturesCols):
         typeConverter=TypeConverters.toBoolean,
     )
 
+    idCol = Param(
+        Params._dummy(),
+        "idCol",
+        "id column name.",
+        typeConverter=TypeConverters.toString,
+    )
+
     def getFeaturesCol(self) -> Union[str, List[str]]:  # type: ignore
         """
         Gets the value of :py:attr:`featuresCol` or :py:attr:`featuresCols`
@@ -203,6 +218,37 @@ class _DBSCANCumlParams(_CumlParams, HasFeaturesCol, HasFeaturesCols):
         """
         self._set_params(predictionCol=value)
         return self
+
+    def setIdCol(self: P, value: str) -> P:
+        """
+        Sets the value of `idCol`. If not set, an id column will be added with column name `unique_id`. The id column is used to specify nearest neighbor vectors by associated id value.
+        """
+        self._set_params(idCol=value)
+        return self
+
+    def getIdCol(self) -> str:
+        """
+        Gets the value of `idCol`.
+        """
+        return self.getOrDefault("idCol")
+
+    def _ensureIdCol(self, df: DataFrame) -> DataFrame:
+        """
+        Ensure an id column exists in the input dataframe. Add the column if not exists.
+        """
+        if not self.isSet("idCol") and self.getIdCol() in df.columns:
+            raise ValueError(
+                f"Cannot create a default id column since a column with the default name '{self.getIdCol()}' already exists."
+                + "Please specify an id column"
+            )
+
+        id_col_name = self.getIdCol()
+        df_withid = (
+            df
+            if self.isSet("idCol")
+            else df.select(monotonically_increasing_id().alias(id_col_name), "*")
+        )
+        return df_withid
 
 
 class DBSCAN(DBSCANClass, _CumlEstimator, _DBSCANCumlParams):
@@ -238,6 +284,39 @@ class DBSCAN(DBSCANClass, _CumlEstimator, _DBSCANCumlParams):
     def getEps(self) -> float:
         return self.getOrDefault("eps")
 
+    def setMin_samples(self: P, value: int) -> P:
+        return self._set_params(min_samples=value)
+
+    def getMin_samples(self) -> int:
+        return self.getOrDefault("min_samples")
+
+    def setMetric(self: P, value: str) -> P:
+        return self._set_params(metric=value)
+
+    def getMetric(self) -> str:
+        return self.getOrDefault("metric")
+
+    def _pre_process_data(self, dataset: DataFrame) -> Tuple[
+        List[Column],
+        Optional[List[str]],
+        int,
+        Union[Type[FloatType], Type[DoubleType]],
+    ]:
+        (
+            select_cols,
+            multi_col_names,
+            dimension,
+            feature_type,
+        ) = _CumlCaller._pre_process_data(self, dataset)
+
+        if self.hasParam("idCol") and self.isDefined("idCol"):
+            id_col_name = self.getOrDefault("idCol")
+            select_cols.append(col(id_col_name).alias(alias.row_number))
+        else:
+            select_cols.append(col(alias.row_number))
+
+        return select_cols, multi_col_names, dimension, feature_type
+
     def _fit(self, dataset: DataFrame) -> _CumlModel:
         spark = _get_spark_session()
 
@@ -257,23 +336,32 @@ class DBSCAN(DBSCANClass, _CumlEstimator, _DBSCANCumlParams):
 
             return chunks
 
+        dataset = self._ensureIdCol(dataset)
         select_cols, multi_col_names, dimension, _ = self._pre_process_data(dataset)
         use_sparse_array = _use_sparse_in_cuml(dataset)
         input_dataset = dataset.select(*select_cols)
-        raw_data: np.ndarray = np.array(input_dataset.toPandas())
+        pd_dataset: pd.DataFrame = input_dataset.toPandas()
+        raw_data: np.ndarray = np.array(pd_dataset.drop(columns=[self.getIdCol()]))
+        idCols: np.ndarray = np.array(pd_dataset[self.getIdCol()])
 
         broadcast_raw_data = [
             spark.sparkContext.broadcast(chunk) for chunk in _chunk_arr(raw_data)
         ]
 
+        broadcast_idCol = [
+            spark.sparkContext.broadcast(chunk) for chunk in _chunk_arr(idCols)
+        ]
+
         model = DBSCANModel(
             raw_data_=broadcast_raw_data,
+            idCols_=broadcast_idCol,
             n_cols=len(raw_data[0]),
             dtype=type(raw_data[0][0][0]).__name__,
             output_schema=dataset.schema,
-            input_cols=input_dataset.columns,
+            input_cols=input_dataset.drop(self.getIdCol()).columns,
             multi_col_names=multi_col_names,
             use_sparse_array=use_sparse_array,
+            verbose=self.verbose,
         )
 
         model._num_workers = self.num_workers
@@ -310,44 +398,76 @@ class DBSCANModel(
         n_cols: int,
         dtype: str,
         raw_data_: List[pyspark.broadcast.Broadcast],
+        idCols_: List[pyspark.broadcast.Broadcast],
         output_schema: StructType,
         input_cols: List[str],
         multi_col_names: List[str] | None,
-        use_sparse_array: bool
+        use_sparse_array: bool,
+        verbose: int | bool,
     ):
         super(DBSCANClass, self).__init__()
-
         super(_CumlModelWithPredictionCol, self).__init__(
             n_cols=n_cols, dtype=dtype, raw_data_=raw_data_
         )
-
         super(_DBSCANCumlParams, self).__init__()
 
+        self._setDefault(
+            eps=0.5,
+            min_samples=5,
+            metric="euclidean",
+            max_mbytes_per_batch=None,
+            calc_core_sample_indices=True,
+            idCol=alias.row_number,
+        )
+
         self._dbscan_spark_model = None
-        self.output_schema = output_schema
+        self.output_schema = StructType(output_schema.fields[:])
         self.input_cols = input_cols
         self.raw_data_ = raw_data_
+        self.idCols_ = idCols_
         self.multi_col_names = multi_col_names
         self.use_sparse_array = use_sparse_array
+        self.verbose = verbose
 
-    def _pre_process_data(self, dataset: DataFrame) -> Tuple[
+    def _pre_process_data(self, dataset: DataFrame) -> Tuple[  # type: ignore
         List[Column],
         Optional[List[str]],
         int,
         Union[Type[FloatType], Type[DoubleType]],
     ]:
-        return _CumlCaller._pre_process_data(self, dataset)
+        (
+            select_cols,
+            multi_col_names,
+            dimension,
+            feature_type,
+        ) = _CumlCaller._pre_process_data(self, dataset)
+
+        if self.hasParam("idCol") and self.isDefined("idCol"):
+            id_col_name = self.getOrDefault("idCol")
+            select_cols.append(col(id_col_name).alias(alias.row_number))
+        else:
+            select_cols.append(col(alias.row_number))
+
+        return select_cols, multi_col_names, dimension, feature_type
 
     def _out_schema(
         self, input_schema: StructType = StructType()
     ) -> Union[StructType, str]:
-        return self.output_schema
+        return StructType(
+            [
+                StructField(self._get_prediction_name(), IntegerType(), False),
+                StructField(self.getIdCol(), LongType(), False),
+            ]
+        )
 
     def _transform_array_order(self) -> _ArrayOrder:
         return "C"
 
     def _fit_array_order(self) -> _ArrayOrder:
         return "C"
+
+    def _require_nccl_ucx(self) -> Tuple[bool, bool]:
+        return (True, True)
 
     def _get_cuml_fit_func(
         self,
@@ -357,9 +477,14 @@ class DBSCANModel(
         [FitInputType, Dict[str, Any]],
         Dict[str, Any],
     ]:
+        import cupy as cp
+        import cupyx
+
         dtype = self.dtype
         n_cols = self.n_cols
         array_order = self._fit_array_order()
+        pred_name = self._get_prediction_name()
+        idCol_name = self.getIdCol()
         logger = get_logger(self.__class__)
 
         cuda_managed_mem_enabled = (
@@ -368,6 +493,12 @@ class DBSCANModel(
         )
 
         inputs = []
+
+        idCol = list(
+            self.idCols_[0].value
+            if len(self.idCols_) == 1
+            else np.concatenate([chunk.value for chunk in self.idCols_])
+        )
 
         for pdf_bc in self.raw_data_:
             pdf = pd.DataFrame(data=pdf_bc.value, columns=self.input_cols)
@@ -386,12 +517,12 @@ class DBSCANModel(
             if cuda_managed_mem_enabled:
                 features = (
                     cp.array(features)
-                    if use_sparse_array is False
+                    if self.use_sparse_array is False
                     else cupyx.scipy.sparse.csr_matrix(features)
                 )
 
             inputs.append(features)
-        
+
         if isinstance(inputs[0], pd.DataFrame):
             concated = pd.concat(inputs)
         else:
@@ -403,6 +534,12 @@ class DBSCANModel(
             params: Dict[str, Any],
         ) -> Dict[str, Any]:
             from cuml.cluster.dbscan_mg import DBSCANMG as CumlDBSCANMG
+            from pyspark import BarrierTaskContext
+
+            context = BarrierTaskContext.get()
+            partition_id = context.partitionId()
+
+            logger = get_logger(self.__class__)
 
             dbscan = CumlDBSCANMG(
                 handle=params[param_alias.handle],
@@ -412,22 +549,35 @@ class DBSCANModel(
                 metric=self.metric,
                 max_mbytes_per_batch=self.max_mbytes_per_batch,
                 calc_core_sample_indices=self.calc_core_sample_indices,
+                verbose=self.verbose,
             )
-            dbscan.n_cols = n_cols
+            dbscan.n_cols = params[param_alias.num_cols]
             dbscan.dtype = np.dtype(dtype)
 
             res = list(dbscan.fit_predict(concated).to_numpy())
 
-            return pd.Series(res)
+            if partition_id == 0:
+                return {
+                    idCol_name: idCol,
+                    pred_name: res,
+                }
+            else:
+                return {
+                    idCol_name: [],
+                    pred_name: [],
+                }
 
         return _cuml_fit
 
     def fit_post_process(
-        self, fit_result: Dict[str, Any]
+        self, fit_result: Dict[str, Any], partition_id: int
     ) -> pd.DataFrame:
-        self.features_df[self._get_prediction_name()] = fit_result
+        if partition_id == 0:
+            df = pd.DataFrame(fit_result)
 
-        return self.features_df
+            return df
+
+        return pd.DataFrame([])
 
     def _call_cuml_fit_func_df(
         self,
@@ -453,6 +603,7 @@ class DBSCANModel(
         cls = self.__class__
 
         select_cols, multi_col_names, dimension, _ = self._pre_process_data(dataset)
+        logger = get_logger(self.__class__)
 
         num_workers = self.num_workers
 
@@ -584,7 +735,7 @@ class DBSCANModel(
                 # memory.  do not rely on inputs after this call.
                 result = cuml_fit_func(inputs, params)
                 result_df = (
-                    fit_post_process_func(result)
+                    fit_post_process_func(result, partition_id)
                     if fit_post_process_func is not None
                     else pd.DataFrame(data=result)
                 )
@@ -614,44 +765,21 @@ class DBSCANModel(
         _TransformFunc,
         Optional[_EvaluateFunc],
     ]:
-
-        dtype = self.dtype
-        n_cols = self.n_cols
-        array_order = self._transform_array_order()
-
-        def _construct_dbscan() -> CumlT:
-            from cuml.cluster.dbscan_mg import DBSCANMG as CumlDBSCANMG
-
-            dbscan = CumlDBSCANMG(
-                output_type="cudf",
-                eps=self.eps,
-            )
-            from spark_rapids_ml.utils import cudf_to_cuml_array
-
-            dbscan.n_cols = n_cols
-            dbscan.dtype = np.dtype(dtype)
-            return dbscan
-
-        def _transform_internal(
-            dbscan: CumlT, df: Union[pd.DataFrame, np.ndarray]
-        ) -> pd.Series:
-            # Delete the worker id column used for partition
-            data_df = df[:, :-1]
-
-            res = list(dbscan.fit_predict(data_df).to_numpy())
-            return pd.Series(res)
-
-        return _construct_dbscan, _transform_internal, None
+        raise NotImplementedError(
+            "DBSCAN does not can not have a separate transform UDF"
+        )
 
     def _transform(self, dataset: DataFrame) -> DataFrame:
         logger = get_logger(self.__class__)
+        dataset = self._ensureIdCol(dataset)
         self.features_df = dataset.toPandas()
         self.output_schema.add(self._get_prediction_name(), IntegerType(), False)
+        idCol_name = self.getIdCol()
 
         default_num_partitions = dataset.rdd.getNumPartitions()
 
         # Return
-        rdd = self._call_cuml_fit_func_df(
+        rdd = self._call_cuml_fit_func(
             dataset=dataset,
             partially_collect=False,
             paramMaps=None,
@@ -660,13 +788,4 @@ class DBSCANModel(
 
         pred_df = rdd.toDF()
 
-        return pred_df
-
-        # window_spec = Window.orderBy(lit(1))
-        # pred_df = pred_df.withColumn("index", row_number().over(window_spec))
-        # dataset = dataset.withColumn("index", row_number().over(window_spec))
-
-        # dataset.show()
-        # pred_df.show()
-
-        # return dataset.join(pred_df, "index").drop("index")
+        return dataset.join(pred_df, idCol_name).drop(idCol_name)
