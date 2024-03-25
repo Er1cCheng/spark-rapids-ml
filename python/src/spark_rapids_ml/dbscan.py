@@ -14,6 +14,8 @@
 # limitations under the License.
 #
 
+import json
+import os
 from abc import ABCMeta
 from typing import (
     TYPE_CHECKING,
@@ -37,6 +39,7 @@ from pyspark import RDD, keyword_only
 from pyspark.ml.functions import array_to_vector, vector_to_array
 from pyspark.ml.linalg import Vector
 from pyspark.ml.param.shared import HasFeaturesCol, Param, Params, TypeConverters
+from pyspark.ml.util import DefaultParamsReader, DefaultParamsWriter, MLReader, MLWriter
 from pyspark.sql import Column
 from pyspark.sql.dataframe import DataFrame
 from pyspark.sql.functions import (
@@ -71,6 +74,8 @@ from .core import (
     _CumlEstimator,
     _CumlModel,
     _CumlModelWithPredictionCol,
+    _CumlModelReader,
+    _CumlModelWriter,
     _EvaluateFunc,
     _read_csr_matrix_from_unwrapped_spark_vec,
     _TransformFunc,
@@ -106,7 +111,7 @@ class DBSCANClass(_CumlClass):
         return {
             "eps": 0.5,
             "min_samples": 5,
-            "metric": "‘euclidean’",
+            "metric": "euclidean",
             "verbose": False,
             "max_mbytes_per_batch": None,
             "calc_core_sample_indices": True,
@@ -343,6 +348,7 @@ class DBSCAN(DBSCANClass, _CumlEstimator, _DBSCANCumlParams):
         pd_dataset: pd.DataFrame = input_dataset.toPandas()
         raw_data: np.ndarray = np.array(pd_dataset.drop(columns=[self.getIdCol()]))
         idCols: np.ndarray = np.array(pd_dataset[self.getIdCol()])
+        input_col, input_cols = self._get_input_columns()
 
         broadcast_raw_data = [
             spark.sparkContext.broadcast(chunk) for chunk in _chunk_arr(raw_data)
@@ -356,12 +362,14 @@ class DBSCAN(DBSCANClass, _CumlEstimator, _DBSCANCumlParams):
             raw_data_=broadcast_raw_data,
             idCols_=broadcast_idCol,
             n_cols=len(raw_data[0]),
-            dtype=type(raw_data[0][0][0]).__name__,
+            dtype=type(raw_data[0][0][0]).__name__ if type(raw_data[0][0]) == List else type(raw_data[0][0]),
             output_schema=dataset.schema,
-            input_cols=input_dataset.drop(self.getIdCol()).columns,
+            processed_input_cols=input_dataset.drop(self.getIdCol()).columns,
             multi_col_names=multi_col_names,
             use_sparse_array=use_sparse_array,
             verbose=self.verbose,
+            input_col=input_col,
+            input_cols=input_cols,
         )
 
         model._num_workers = self.num_workers
@@ -400,10 +408,12 @@ class DBSCANModel(
         raw_data_: List[pyspark.broadcast.Broadcast],
         idCols_: List[pyspark.broadcast.Broadcast],
         output_schema: StructType,
-        input_cols: List[str],
+        processed_input_cols: List[str],
         multi_col_names: List[str] | None,
         use_sparse_array: bool,
         verbose: int | bool,
+        input_col: Optional[str],
+        input_cols: Optional[List[str]],
     ):
         super(DBSCANClass, self).__init__()
         super(_CumlModelWithPredictionCol, self).__init__(
@@ -422,12 +432,18 @@ class DBSCANModel(
 
         self._dbscan_spark_model = None
         self.output_schema = StructType(output_schema.fields[:])
-        self.input_cols = input_cols
+        self.processed_input_cols = processed_input_cols
         self.raw_data_ = raw_data_
         self.idCols_ = idCols_
         self.multi_col_names = multi_col_names
         self.use_sparse_array = use_sparse_array
         self.verbose = verbose
+
+        if input_col is not None:
+            self.setFeaturesCol(input_col)
+        
+        if input_cols is not None:
+            self.setFeaturesCols(input_cols)
 
     def _pre_process_data(self, dataset: DataFrame) -> Tuple[  # type: ignore
         List[Column],
@@ -501,7 +517,7 @@ class DBSCANModel(
         )
 
         for pdf_bc in self.raw_data_:
-            pdf = pd.DataFrame(data=pdf_bc.value, columns=self.input_cols)
+            pdf = pd.DataFrame(data=pdf_bc.value, columns=self.processed_input_cols)
 
             if self.multi_col_names:
                 features = np.array(pdf[self.multi_col_names], order=array_order)
@@ -579,185 +595,6 @@ class DBSCANModel(
 
         return pd.DataFrame([])
 
-    def _call_cuml_fit_func_df(
-        self,
-        dataset: DataFrame,
-        partially_collect: bool = True,
-        paramMaps: Optional[Sequence["ParamMap"]] = None,
-    ) -> RDD:
-        """
-        Fits a model to the input dataset. This is called by the default implementation of fit.
-
-        Parameters
-        ----------
-        dataset : :py:class:`pyspark.sql.DataFrame`
-            input dataset
-
-        Returns
-        -------
-        :class:`Transformer`
-            fitted model
-        """
-        self._validate_parameters()
-
-        cls = self.__class__
-
-        select_cols, multi_col_names, dimension, _ = self._pre_process_data(dataset)
-        logger = get_logger(self.__class__)
-
-        num_workers = self.num_workers
-
-        dataset = dataset.select(*select_cols)
-
-        if dataset.rdd.getNumPartitions() != num_workers:
-            dataset = self._repartition_dataset(dataset)
-
-        is_local = _is_local(_get_spark_session().sparkContext)
-
-        cuda_managed_mem_enabled = (
-            _get_spark_session().conf.get("spark.rapids.ml.uvm.enabled", "false")
-            == "true"
-        )
-        if cuda_managed_mem_enabled:
-            get_logger(cls).info("CUDA managed memory enabled.")
-
-        # parameters passed to subclass
-        params: Dict[str, Any] = {
-            param_alias.cuml_init: self.cuml_params,
-        }
-
-        # Convert the paramMaps into cuml paramMaps
-        fit_multiple_params = []
-        if paramMaps is not None:
-            for paramMap in paramMaps:
-                tmp_fit_multiple_params = {}
-                for k, v in paramMap.items():
-                    name = self._get_cuml_param(k.name, False)
-                    assert name is not None
-                    tmp_fit_multiple_params[name] = self._get_cuml_mapping_value(
-                        name, v
-                    )
-                fit_multiple_params.append(tmp_fit_multiple_params)
-        params[param_alias.fit_multiple_params] = fit_multiple_params
-
-        cuml_fit_func = self._get_cuml_fit_func(
-            dataset, None if len(fit_multiple_params) == 0 else fit_multiple_params
-        )
-
-        fit_post_process_func = (
-            self.fit_post_process
-            if hasattr(self.__class__, "fit_post_process")
-            else None
-        )
-
-        array_order = self._fit_array_order()
-
-        cuml_verbose = self.cuml_params.get("verbose", False)
-
-        use_sparse_array = _use_sparse_in_cuml(dataset)
-
-        (enable_nccl, require_ucx) = self._require_nccl_ucx()
-
-        def _train_udf(pdf_iter: Iterator[pd.DataFrame]) -> pd.DataFrame:
-            import cupy as cp
-            import cupyx
-            from pyspark import BarrierTaskContext
-
-            context = BarrierTaskContext.get()
-            partition_id = context.partitionId()
-            logger = get_logger(cls)
-
-            # set gpu device
-            _CumlCommon._set_gpu_device(context, is_local)
-
-            if cuda_managed_mem_enabled:
-                import rmm
-                from rmm.allocators.cupy import rmm_cupy_allocator
-
-                rmm.reinitialize(
-                    managed_memory=True,
-                    devices=_CumlCommon._get_gpu_device(context, is_local),
-                )
-                cp.cuda.set_allocator(rmm_cupy_allocator)
-
-            _CumlCommon._initialize_cuml_logging(cuml_verbose)
-
-            # handle the input
-            # inputs = [(X, Optional(y)), (X, Optional(y))]
-            logger.info("Loading data into python worker memory")
-            inputs = []
-            sizes = []
-
-            for pdf in pdf_iter:
-                sizes.append(pdf.shape[0])
-                if multi_col_names:
-                    features = np.array(pdf[multi_col_names], order=array_order)
-                elif use_sparse_array:
-                    # sparse vector
-                    features = _read_csr_matrix_from_unwrapped_spark_vec(pdf)
-                else:
-                    # dense vector
-                    features = np.array(list(pdf[alias.data]), order=array_order)
-
-                # experiments indicate it is faster to convert to numpy array and then to cupy array than directly
-                # invoking cupy array on the list
-                if cuda_managed_mem_enabled:
-                    features = (
-                        cp.array(features)
-                        if use_sparse_array is False
-                        else cupyx.scipy.sparse.csr_matrix(features)
-                    )
-
-                label = pdf[alias.label] if alias.label in pdf.columns else None
-                row_number = (
-                    pdf[alias.row_number] if alias.row_number in pdf.columns else None
-                )
-                inputs.append((features, label, row_number))
-
-            if len(sizes) == 0 or all(sz == 0 for sz in sizes):
-                raise RuntimeError(
-                    "A python worker received no data.  Please increase amount of data or use fewer workers."
-                )
-
-            logger.info("Initializing cuml context")
-            with CumlContext(
-                partition_id, num_workers, context, enable_nccl, require_ucx
-            ) as cc:
-                params[param_alias.handle] = cc.handle
-                params[param_alias.part_sizes] = sizes
-                params[param_alias.num_cols] = dimension
-                params[param_alias.loop] = cc._loop
-
-                logger.info("Invoking cuml fit")
-
-                # call the cuml fit function
-                # *note*: cuml_fit_func may delete components of inputs to free
-                # memory.  do not rely on inputs after this call.
-                result = cuml_fit_func(inputs, params)
-                result_df = (
-                    fit_post_process_func(result, partition_id)
-                    if fit_post_process_func is not None
-                    else pd.DataFrame(data=result)
-                )
-                logger.info("Cuml fit complete")
-
-            if partially_collect == True:
-                if enable_nccl:
-                    context.barrier()
-
-                if context.partitionId() == 0:
-                    yield result_df
-            else:
-                yield result_df
-
-        pipelined_rdd = (
-            dataset.mapInPandas(_train_udf, schema=self._out_schema())  # type: ignore
-            .rdd.barrier()
-            .mapPartitions(lambda x: x)
-        )
-
-        return pipelined_rdd
-
     def _get_cuml_transform_func(
         self, dataset: DataFrame, eval_metric_info: Optional[EvalMetricInfo] = None
     ) -> Tuple[
@@ -789,3 +626,100 @@ class DBSCANModel(
         pred_df = rdd.toDF()
 
         return dataset.join(pred_df, idCol_name).drop(idCol_name)
+    
+    def _get_model_attributes(self) -> Optional[Dict[str, Any]]:
+        """
+        Override parent method to bring broadcast variables to driver before JSON serialization.
+        """
+
+        self._model_attributes["idCols_"] = [
+            chunk.value for chunk in self.idCols_
+        ]
+        self._model_attributes["raw_data_"] = [chunk.value for chunk in self.raw_data_]
+
+        self._model_attributes["eps"]=self.eps
+        self._model_attributes["min_samples"]=self.min_samples
+        self._model_attributes["metric"]=self.metric
+        self._model_attributes["max_mbytes_per_batch"]=self.max_mbytes_per_batch
+        self._model_attributes["calc_core_sample_indices"]=self.calc_core_sample_indices
+        self._model_attributes["verbose"]=self.verbose
+        self._model_attributes["output_schema"]=self.output_schema
+        self._model_attributes["processed_input_cols"]=self.processed_input_cols
+        self._model_attributes["multi_col_names"]=self.multi_col_names
+        self._model_attributes["use_sparse_array"]=self.use_sparse_array
+
+        return self._model_attributes
+    
+    def write(self) -> MLWriter:
+        return _CumlModelWriterNumpy(self)
+
+    @classmethod
+    def read(cls) -> MLReader:
+        return _CumlModelReaderNumpy(cls)
+
+class _CumlModelWriterNumpy(_CumlModelWriter):
+    """
+    Override parent writer to save numpy objects of _CumlModel to the file
+    """
+
+    def saveImpl(self, path: str) -> None:
+        DefaultParamsWriter.saveMetadata(
+            self.instance,
+            path,
+            self.sc,
+            extraMetadata={
+                "_cuml_params": self.instance._cuml_params,
+                "_num_workers": self.instance._num_workers,
+                "_float32_inputs": self.instance._float32_inputs,
+            },
+        )
+        data_path = os.path.join(path, "data")
+        model_attributes = self.instance._get_model_attributes()
+
+        if not os.path.exists(data_path):
+            os.makedirs(data_path)
+        assert model_attributes is not None
+        for key, value in model_attributes.items():
+            if isinstance(value, list) and isinstance(value[0], np.ndarray):
+                paths = []
+                for idx, chunk in enumerate(value):
+                    array_path = os.path.join(data_path, f"{key}_{idx}.npy")
+                    np.save(array_path, chunk)
+                    paths.append(array_path)
+                model_attributes[key] = paths
+
+        metadata_file_path = os.path.join(data_path, "metadata.json")
+        model_attributes_str = json.dumps(model_attributes)
+        self.sc.parallelize([model_attributes_str], 1).saveAsTextFile(
+            metadata_file_path
+        )
+
+
+class _CumlModelReaderNumpy(_CumlModelReader):
+    """
+    Override parent reader to instantiate numpy objects of _CumlModel from file
+    """
+
+    def load(self, path: str) -> "_CumlEstimator":
+        metadata = DefaultParamsReader.loadMetadata(path, self.sc)
+        data_path = os.path.join(path, "data")
+        metadata_file_path = os.path.join(data_path, "metadata.json")
+
+        model_attr_str = self.sc.textFile(metadata_file_path).collect()[0]
+        model_attr_dict = json.loads(model_attr_str)
+
+        for key, value in model_attr_dict.items():
+            if isinstance(value, list) and value[0].endswith(".npy"):
+                arrays = []
+                spark = _get_spark_session()
+                for array_path in value:
+                    array = np.load(array_path)
+                    arrays.append(spark.sparkContext.broadcast(array))
+                model_attr_dict[key] = arrays
+
+        instance = self.model_cls(**model_attr_dict)
+        DefaultParamsReader.getAndSetParams(instance, metadata)
+        instance._cuml_params = metadata["_cuml_params"]
+        instance._num_workers = metadata["_num_workers"]
+        instance._float32_inputs = metadata["_float32_inputs"]
+        return instance
