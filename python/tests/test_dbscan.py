@@ -72,12 +72,12 @@ def test_dbscan_params(
     default_dbscan = DBSCAN()
     assert_params(default_dbscan, default_spark_params, default_cuml_params)
 
-    # # Estimator persistence
-    # path = tmp_path + "/kmeans_tests"
-    # estimator_path = f"{path}/kmeans"
-    # cuml_dbscan.write().overwrite().save(estimator_path)
-    # loaded_kmeans = DBSCAN.load(estimator_path)
-    # assert_params(loaded_kmeans, expected_spark_params, expected_cuml_params)
+    # Estimator persistence
+    path = tmp_path + "/dbscan_tests"
+    estimator_path = f"{path}/dbscan"
+    default_dbscan.write().overwrite().save(estimator_path)
+    loaded_dbscan = DBSCAN.load(estimator_path)
+    assert_params(loaded_dbscan, default_spark_params, default_cuml_params)
 
 
 def test_dbscan_basic(
@@ -109,10 +109,6 @@ def test_dbscan_basic(
         model_path = f"{path}/dbscan_model"
         dbscan_model.write().overwrite().save(model_path)
         dbscan_model_loaded = DBSCANModel.load(model_path)
-        # assert_kmeans_model(model=kmeans_model_loaded)
-
-        # assert isinstance(kmeans_model_loaded.cpu(), SparkKMeansModel)
-        # assert_cuml_spark_model(kmeans_model_loaded, kmeans_model_loaded.cpu())
 
         # test transform function
         dbscan_model.setPredictionCol("prediction")
@@ -128,7 +124,6 @@ def test_dbscan_basic(
         assert labels[2] == labels[3]
 
         # Test the loaded model
-        print(dbscan_model_loaded.eps)
         dbscan_model_loaded.setPredictionCol("prediction")
         label_df = dbscan_model_loaded.transform(df)
         assert ["features", "prediction"] == sorted(label_df.columns)
@@ -163,14 +158,11 @@ def test_dbscan_numeric_type(gpu_number: int, data_type: str) -> None:
         label_df = dbscan_model.transform(df)
 
 
-# @pytest.mark.parametrize("gpu_number", [4])
 @pytest.mark.parametrize("feature_type", pyspark_supported_feature_types)
 @pytest.mark.parametrize("data_shape", [(1000, 20)], ids=idfn)
 @pytest.mark.parametrize("data_type", cuml_supported_data_types)
-# @pytest.mark.parametrize("data_type", [np.float32])
 @pytest.mark.parametrize("max_record_batch", [100, 10000])
-# @pytest.mark.parametrize("max_record_batch", [10000])
-# @pytest.mark.slow
+@pytest.mark.slow
 def test_dbscan_self(
     gpu_number: int,
     feature_type: str,
@@ -263,19 +255,3 @@ def test_dbscan_self(
             else:
                 cluster_dict[label_rapids] = label_cuml
 
-
-# def test_parameters_validation() -> None:
-#     data = [
-#         ([1.0, 2.0], 1.0),
-#         ([3.0, 1.0], 0.0),
-#     ]
-
-#     with CleanSparkSession() as spark:
-#         features_col = "features"
-#         label_col = "label"
-#         schema = features_col + " array<float>, " + label_col + " float"
-#         df = spark.createDataFrame(data, schema=schema)
-
-#         with pytest.raises(ValueError, match="Invalid value for metric: random"):
-#             model = DBSCAN(num_workers=1).setMetric("random").fit(df)
-#             model.transform(df)
