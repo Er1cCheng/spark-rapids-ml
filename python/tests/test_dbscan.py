@@ -30,11 +30,12 @@ else:
 # from pyspark.ml.clustering import KMeans as SparkKMeans
 # from pyspark.ml.clustering import KMeansModel as SparkKMeansModel
 from pyspark.ml.functions import array_to_vector
-from pyspark.ml.linalg import Vectors, DenseVector
-from pyspark.sql.functions import col
+from pyspark.ml.linalg import DenseVector, Vectors
 from pyspark.sql.dataframe import DataFrame
+from pyspark.sql.functions import col
 
 from spark_rapids_ml.dbscan import DBSCAN, DBSCANModel
+
 from .sparksession import CleanSparkSession
 from .utils import (
     assert_params,
@@ -84,7 +85,12 @@ def test_dbscan_basic(
 ) -> None:
     # reduce the number of GPUs for toy dataset to avoid empty partition
     gpu_number = min(gpu_number, 2)
-    data = [([0.0, 0.0]),([1.0, 1.0]),([9.0, 8.0]),([8.0, 9.0]),]
+    data = [
+        ([0.0, 0.0]),
+        ([1.0, 1.0]),
+        ([9.0, 8.0]),
+        ([8.0, 9.0]),
+    ]
 
     with CleanSparkSession() as spark:
         df = (
@@ -92,9 +98,8 @@ def test_dbscan_basic(
             .map(lambda row: (row,))
             .toDF(["features"])
         )
-        dbscan = (
-            DBSCAN(num_workers=gpu_number, min_samples=2, eps=2)
-            .setFeaturesCol("features")
+        dbscan = DBSCAN(num_workers=gpu_number, min_samples=2, eps=2).setFeaturesCol(
+            "features"
         )
 
         dbscan_model = dbscan.fit(df)
@@ -115,6 +120,20 @@ def test_dbscan_basic(
         assert ["features", "prediction"] == sorted(label_df.columns)
 
         o_col = dbscan_model.getPredictionCol()
+        labels = [row[o_col] for row in label_df.collect()]
+
+        assert len(labels) == 4
+        assert labels[0] == labels[1]
+        assert labels[1] != labels[2]
+        assert labels[2] == labels[3]
+
+        # Test the loaded model
+        print(dbscan_model_loaded.eps)
+        dbscan_model_loaded.setPredictionCol("prediction")
+        label_df = dbscan_model_loaded.transform(df)
+        assert ["features", "prediction"] == sorted(label_df.columns)
+
+        o_col = dbscan_model_loaded.getPredictionCol()
         labels = [row[o_col] for row in label_df.collect()]
 
         assert len(labels) == 4
@@ -143,13 +162,14 @@ def test_dbscan_numeric_type(gpu_number: int, data_type: str) -> None:
         dbscan_model = dbscan.fit(df)
         label_df = dbscan_model.transform(df)
 
+
 # @pytest.mark.parametrize("gpu_number", [4])
 @pytest.mark.parametrize("feature_type", pyspark_supported_feature_types)
 @pytest.mark.parametrize("data_shape", [(1000, 20)], ids=idfn)
-# @pytest.mark.parametrize("data_type", cuml_supported_data_types)
-@pytest.mark.parametrize("data_type", [np.float32])
-# @pytest.mark.parametrize("max_record_batch", [100, 10000])
-@pytest.mark.parametrize("max_record_batch", [10000])
+@pytest.mark.parametrize("data_type", cuml_supported_data_types)
+# @pytest.mark.parametrize("data_type", [np.float32])
+@pytest.mark.parametrize("max_record_batch", [100, 10000])
+# @pytest.mark.parametrize("max_record_batch", [10000])
 # @pytest.mark.slow
 def test_dbscan_self(
     gpu_number: int,
@@ -206,7 +226,11 @@ def test_dbscan_self(
         )
 
         dbscan = DBSCAN(
-            num_workers=gpu_number, eps=eps, min_samples=min_samples, metric=metric, verbose=7
+            num_workers=gpu_number,
+            eps=eps,
+            min_samples=min_samples,
+            metric=metric,
+            verbose=7,
         ).setFeaturesCol(features_col)
 
         dbscan_model = dbscan.fit(df)
@@ -222,7 +246,7 @@ def test_dbscan_self(
 
         label_arr = label_pdf.to_numpy().squeeze()
         feature_matrix = feature_pdf.to_numpy()
-        
+
         for rid, row in enumerate(feature_matrix):
             if isinstance(row[0], DenseVector):
                 data = tuple(row[0].toArray())
@@ -238,6 +262,7 @@ def test_dbscan_self(
                 assert cluster_dict[label_rapids] == label_cuml
             else:
                 cluster_dict[label_rapids] = label_cuml
+
 
 # def test_parameters_validation() -> None:
 #     data = [

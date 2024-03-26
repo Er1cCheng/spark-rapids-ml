@@ -73,8 +73,8 @@ from .core import (
     _CumlCommon,
     _CumlEstimator,
     _CumlModel,
-    _CumlModelWithPredictionCol,
     _CumlModelReader,
+    _CumlModelWithPredictionCol,
     _CumlModelWriter,
     _EvaluateFunc,
     _read_csr_matrix_from_unwrapped_spark_vec,
@@ -358,12 +358,23 @@ class DBSCAN(DBSCANClass, _CumlEstimator, _DBSCANCumlParams):
             spark.sparkContext.broadcast(chunk) for chunk in _chunk_arr(idCols)
         ]
 
+        get_logger(self.__class__).info(raw_data[0])
+
         model = DBSCANModel(
+            eps = self.getOrDefault("eps"),
+            min_samples = self.getOrDefault("min_samples"),
+            metric = self.getOrDefault("metric"),
+            max_mbytes_per_batch = self.getOrDefault("max_mbytes_per_batch"),
+            calc_core_sample_indices = self.getOrDefault("calc_core_sample_indices"),
             raw_data_=broadcast_raw_data,
             idCols_=broadcast_idCol,
             n_cols=len(raw_data[0]),
-            dtype=type(raw_data[0][0][0]).__name__ if type(raw_data[0][0]) == List else type(raw_data[0][0]),
-            output_schema=dataset.schema,
+            dtype=(
+                type(raw_data[0][0][0]).__name__
+                if isinstance(raw_data[0][0], List)
+                or isinstance(raw_data[0][0], np.ndarray)
+                else type(raw_data[0][0]).__name__
+            ),
             processed_input_cols=input_dataset.drop(self.getIdCol()).columns,
             multi_col_names=multi_col_names,
             use_sparse_array=use_sparse_array,
@@ -373,11 +384,11 @@ class DBSCAN(DBSCANClass, _CumlEstimator, _DBSCANCumlParams):
         )
 
         model._num_workers = self.num_workers
-        model.eps = self.getOrDefault("eps")
-        model.min_samples = self.getOrDefault("min_samples")
-        model.metric = self.getOrDefault("metric")
-        model.max_mbytes_per_batch = self.getOrDefault("max_mbytes_per_batch")
-        model.calc_core_sample_indices = self.getOrDefault("calc_core_sample_indices")
+        # model.eps = self.getOrDefault("eps")
+        # model.min_samples = self.getOrDefault("min_samples")
+        # model.metric = self.getOrDefault("metric")
+        # model.max_mbytes_per_batch = self.getOrDefault("max_mbytes_per_batch")
+        # model.calc_core_sample_indices = self.getOrDefault("calc_core_sample_indices")
 
         return model
 
@@ -403,11 +414,15 @@ class DBSCANModel(
 ):
     def __init__(
         self,
+        eps: float,
+        min_samples: int,
+        metric: str,
+        max_mbytes_per_batch: Optional[int],
+        calc_core_sample_indices: bool,
         n_cols: int,
         dtype: str,
         raw_data_: List[pyspark.broadcast.Broadcast],
         idCols_: List[pyspark.broadcast.Broadcast],
-        output_schema: StructType,
         processed_input_cols: List[str],
         multi_col_names: List[str] | None,
         use_sparse_array: bool,
@@ -430,8 +445,14 @@ class DBSCANModel(
             idCol=alias.row_number,
         )
 
+        self.eps = eps
+        self.min_samples = min_samples
+        self.metric = metric
+        self.max_mbytes_per_batch = max_mbytes_per_batch
+        self.calc_core_sample_indices = calc_core_sample_indices
+
         self._dbscan_spark_model = None
-        self.output_schema = StructType(output_schema.fields[:])
+        # self.output_schema = StructType(output_schema.fields[:])
         self.processed_input_cols = processed_input_cols
         self.raw_data_ = raw_data_
         self.idCols_ = idCols_
@@ -441,7 +462,7 @@ class DBSCANModel(
 
         if input_col is not None:
             self.setFeaturesCol(input_col)
-        
+
         if input_cols is not None:
             self.setFeaturesCols(input_cols)
 
@@ -610,7 +631,7 @@ class DBSCANModel(
         logger = get_logger(self.__class__)
         dataset = self._ensureIdCol(dataset)
         self.features_df = dataset.toPandas()
-        self.output_schema.add(self._get_prediction_name(), IntegerType(), False)
+        # self.output_schema.add(self._get_prediction_name(), IntegerType(), False)
         idCol_name = self.getIdCol()
 
         default_num_partitions = dataset.rdd.getNumPartitions()
@@ -626,36 +647,37 @@ class DBSCANModel(
         pred_df = rdd.toDF()
 
         return dataset.join(pred_df, idCol_name).drop(idCol_name)
-    
+
     def _get_model_attributes(self) -> Optional[Dict[str, Any]]:
         """
         Override parent method to bring broadcast variables to driver before JSON serialization.
         """
 
-        self._model_attributes["idCols_"] = [
-            chunk.value for chunk in self.idCols_
-        ]
+        self._model_attributes["idCols_"] = [chunk.value for chunk in self.idCols_]
         self._model_attributes["raw_data_"] = [chunk.value for chunk in self.raw_data_]
 
-        self._model_attributes["eps"]=self.eps
-        self._model_attributes["min_samples"]=self.min_samples
-        self._model_attributes["metric"]=self.metric
-        self._model_attributes["max_mbytes_per_batch"]=self.max_mbytes_per_batch
-        self._model_attributes["calc_core_sample_indices"]=self.calc_core_sample_indices
-        self._model_attributes["verbose"]=self.verbose
-        self._model_attributes["output_schema"]=self.output_schema
-        self._model_attributes["processed_input_cols"]=self.processed_input_cols
-        self._model_attributes["multi_col_names"]=self.multi_col_names
-        self._model_attributes["use_sparse_array"]=self.use_sparse_array
+        self._model_attributes["eps"] = self.eps
+        self._model_attributes["min_samples"] = self.min_samples
+        self._model_attributes["metric"] = self.metric
+        self._model_attributes["max_mbytes_per_batch"] = self.max_mbytes_per_batch
+        self._model_attributes["calc_core_sample_indices"] = (
+            self.calc_core_sample_indices
+        )
+        self._model_attributes["verbose"] = self.verbose
+        self._model_attributes["processed_input_cols"] = self.processed_input_cols
+        self._model_attributes["multi_col_names"] = self.multi_col_names
+        self._model_attributes["use_sparse_array"] = self.use_sparse_array
+        self._model_attributes["input_col"], self._model_attributes["input_cols"]= self._get_input_columns()
 
         return self._model_attributes
-    
+
     def write(self) -> MLWriter:
         return _CumlModelWriterNumpy(self)
 
     @classmethod
     def read(cls) -> MLReader:
         return _CumlModelReaderNumpy(cls)
+
 
 class _CumlModelWriterNumpy(_CumlModelWriter):
     """
@@ -684,11 +706,12 @@ class _CumlModelWriterNumpy(_CumlModelWriter):
                 paths = []
                 for idx, chunk in enumerate(value):
                     array_path = os.path.join(data_path, f"{key}_{idx}.npy")
-                    np.save(array_path, chunk)
+                    np.save(array_path, chunk, allow_pickle=True)
                     paths.append(array_path)
                 model_attributes[key] = paths
 
         metadata_file_path = os.path.join(data_path, "metadata.json")
+        print(model_attributes)
         model_attributes_str = json.dumps(model_attributes)
         self.sc.parallelize([model_attributes_str], 1).saveAsTextFile(
             metadata_file_path
@@ -713,12 +736,12 @@ class _CumlModelReaderNumpy(_CumlModelReader):
                 arrays = []
                 spark = _get_spark_session()
                 for array_path in value:
-                    array = np.load(array_path)
+                    array = np.load(array_path, allow_pickle=True)
                     arrays.append(spark.sparkContext.broadcast(array))
                 model_attr_dict[key] = arrays
 
         instance = self.model_cls(**model_attr_dict)
-        DefaultParamsReader.getAndSetParams(instance, metadata)
+        # DefaultParamsReader.getAndSetParams(instance, metadata)
         instance._cuml_params = metadata["_cuml_params"]
         instance._num_workers = metadata["_num_workers"]
         instance._float32_inputs = metadata["_float32_inputs"]
