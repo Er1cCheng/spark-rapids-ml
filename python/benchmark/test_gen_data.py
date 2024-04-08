@@ -385,6 +385,7 @@ def test_make_sparse_regression(
             else:
                 density_num = float(density)
 
+            # Recalculate density values
             if density_curve == "Linear":
                 density_values = np.linspace(
                     num_partitions / row_num, density_num, n_chunks_num
@@ -398,6 +399,7 @@ def test_make_sparse_regression(
                 )
                 density_values *= n_chunks_num * density_num / sum(density_values)
 
+            # Crop density values
             for i in range(len(density_values)):
                 if density_values[i] > 1:
                     density_values[i] = 1
